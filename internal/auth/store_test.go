@@ -388,3 +388,51 @@ func TestParseAccountsEmptyAndToggleDelete(t *testing.T) {
 		t.Fatalf("expected 0 accounts after reload, got %d", len(reloaded.Statuses()))
 	}
 }
+
+func TestStoreUpdateProfileAndPreservation(t *testing.T) {
+	dir := t.TempDir()
+	accPath := filepath.Join(dir, "accounts.json")
+	raw := `{"accounts":[{"id":"social-1","tenant_url":"https://c1.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev","client_id":"cid-1","access_token":"at","access_token_expiry":2000000000}]}`
+	if err := os.WriteFile(accPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(accPath, 5*time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	if !store.UpdateProfile("social-1", "alice@example.com", "Alice Chen", "123456789012", "ext-1") {
+		t.Fatal("expected UpdateProfile to report change")
+	}
+	if store.UpdateProfile("social-1", "alice@example.com", "Alice Chen", "123456789012", "ext-1") {
+		t.Fatal("expected idempotent second UpdateProfile to return false")
+	}
+
+	// Verify Statuses() exposes Email & DisplayName and disk persisted them.
+	sts := store.Statuses()
+	if len(sts) != 1 || sts[0].Email != "alice@example.com" || sts[0].DisplayName != "Alice Chen" {
+		t.Fatalf("unexpected status after UpdateProfile: %+v", sts)
+	}
+	reloaded, err := NewStore(accPath, 5*time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if acct, ok := reloaded.GetAccount("social-1"); !ok || acct.Email != "alice@example.com" || acct.DisplayName != "Alice Chen" || acct.ExternalID != "ext-1" {
+		t.Fatalf("profile did not persist across reload: ok=%v acct=%+v", ok, acct)
+	}
+
+	// Upsert matching by email+tenant_url updates existing account ID and preserves display_name.
+	added, updated, err := UpsertAccountsFile(accPath, []Account{{
+		ID:          "social-new-temp",
+		Email:       "ALICE@example.com",
+		TenantURL:   "https://c1.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+		AccessToken: "at-new",
+	}})
+	if err != nil || len(added) != 0 || len(updated) != 1 || updated[0] != "social-1" {
+		t.Fatalf("expected email match update on social-1, got added=%v updated=%v err=%v", added, updated, err)
+	}
+	reloaded2, _ := NewStore(accPath, 5*time.Minute, "")
+	if acct, ok := reloaded2.GetAccount("social-1"); !ok || acct.DisplayName != "Alice Chen" || acct.AccessToken != "at-new" {
+		t.Fatalf("expected preserved display_name and updated token, got ok=%v acct=%+v", ok, acct)
+	}
+}

@@ -34,6 +34,8 @@ const (
 // Account stores one Amazon Quick social (AWS sso-oidc) account credential.
 type Account struct {
 	ID                    string  `json:"id"`
+	Email                 string  `json:"email,omitempty"`
+	DisplayName           string  `json:"display_name,omitempty"`
 	Disabled              bool    `json:"disabled,omitempty"`
 	ProxyURL              string  `json:"proxy_url,omitempty"`
 	TenantURL             string  `json:"tenant_url"`
@@ -49,7 +51,6 @@ type Account struct {
 	AWSAccountID          string  `json:"aws_account_id,omitempty"`
 	ExternalID            string  `json:"external_id,omitempty"`
 }
-
 // QuotaInfo holds the latest parsed profile/usage snapshot for an account.
 type QuotaInfo struct {
 	MonthlyUsed      int    `json:"monthly_used"`
@@ -69,6 +70,8 @@ type QuotaInfo struct {
 // AccountStatus is a secret-free status snapshot for /healthz and /admin/status.
 type AccountStatus struct {
 	ID                   string     `json:"id"`
+	Email                string     `json:"email,omitempty"`
+	DisplayName          string     `json:"display_name,omitempty"`
 	Disabled             bool       `json:"disabled"`
 	Region               string     `json:"region"`
 	TenantHost           string     `json:"tenant_host"`
@@ -82,7 +85,6 @@ type AccountStatus struct {
 	HasRefreshToken      bool       `json:"has_refresh_token"`
 	Quota                *QuotaInfo `json:"quota,omitempty"`
 }
-
 // ReloadResult summarizes changes detected during an atomic accounts.json hot reload.
 type ReloadResult struct {
 	Total        int      `json:"total"`
@@ -294,14 +296,27 @@ func (s *Store) Reload() (ReloadResult, error) {
 			res.Added = append(res.Added, a.ID)
 			s.runtime[a.ID] = &accountRuntime{}
 		} else {
-			// Preserve newer in-memory refreshed tokens when disk still holds an older access token
-			// for the exact same credential identity.
-			if old.ClientID == a.ClientID && old.TenantURL == a.TenantURL &&
-				old.AccessToken != "" && old.AccessTokenExpiry > a.AccessTokenExpiry {
-				a.AccessToken = old.AccessToken
-				a.AccessTokenExpiry = old.AccessTokenExpiry
-				if old.RefreshToken != "" && old.RefreshToken != a.RefreshToken {
-					a.RefreshToken = old.RefreshToken
+			// Preserve newer in-memory refreshed tokens and discovered profile metadata when disk
+			// holds an older snapshot for the exact same credential identity.
+			if old.ClientID == a.ClientID && old.TenantURL == a.TenantURL {
+				if old.AccessToken != "" && old.AccessTokenExpiry > a.AccessTokenExpiry {
+					a.AccessToken = old.AccessToken
+					a.AccessTokenExpiry = old.AccessTokenExpiry
+					if old.RefreshToken != "" && old.RefreshToken != a.RefreshToken {
+						a.RefreshToken = old.RefreshToken
+					}
+				}
+				if a.Email == "" && old.Email != "" {
+					a.Email = old.Email
+				}
+				if a.DisplayName == "" && old.DisplayName != "" {
+					a.DisplayName = old.DisplayName
+				}
+				if a.AWSAccountID == "" && old.AWSAccountID != "" {
+					a.AWSAccountID = old.AWSAccountID
+				}
+				if a.ExternalID == "" && old.ExternalID != "" {
+					a.ExternalID = old.ExternalID
 				}
 			}
 			oldEffProxy := netproxy.Resolve(old.ProxyURL, s.globalProxy)
@@ -513,6 +528,8 @@ func (s *Store) statusLocked(a *Account, now time.Time) AccountStatus {
 	}
 	return AccountStatus{
 		ID:                   a.ID,
+		Email:                a.Email,
+		DisplayName:          a.DisplayName,
 		Disabled:             a.Disabled,
 		Region:               a.Region,
 		TenantHost:           host,
@@ -757,6 +774,55 @@ func (s *Store) ResetCooldown(id string) int {
 		rt.lastError = ""
 	}
 	return cleared
+}
+
+// UpdateProfile updates an account's non-secret identity metadata (email, display_name,
+// aws_account_id, external_id) learned from Quick's WS connected frame and atomically
+// persists accounts.json only when a field actually changed.
+func (s *Store) UpdateProfile(id, email, displayName, awsAccountID, externalID string) bool {
+	email = strings.TrimSpace(email)
+	displayName = strings.TrimSpace(displayName)
+	awsAccountID = strings.TrimSpace(awsAccountID)
+	externalID = strings.TrimSpace(externalID)
+	if email == "" && displayName == "" && awsAccountID == "" && externalID == "" {
+		return false
+	}
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	var target *Account
+	for _, a := range s.accounts {
+		if a.ID == id {
+			target = a
+			break
+		}
+	}
+	if target == nil {
+		return false
+	}
+	changed := false
+	if email != "" && target.Email != email {
+		target.Email = email
+		changed = true
+	}
+	if displayName != "" && target.DisplayName != displayName {
+		target.DisplayName = displayName
+		changed = true
+	}
+	if awsAccountID != "" && target.AWSAccountID != awsAccountID {
+		target.AWSAccountID = awsAccountID
+		changed = true
+	}
+	if externalID != "" && target.ExternalID != externalID {
+		target.ExternalID = externalID
+		changed = true
+	}
+	if !changed {
+		return false
+	}
+	if err := s.saveLocked(); err != nil {
+		log.Printf("[auth] warning: failed to persist discovered profile for %s: %v", id, err)
+	}
+	return true
 }
 
 // UpdateQuota records the latest Quick profile/usage snapshot and proactively applies
@@ -1041,17 +1107,31 @@ func UpsertAccountsFile(path string, incoming []Account) (added []string, update
 
 		matched := -1
 		for i, ex := range existing {
-			if ex.ID == a.ID || (a.ExternalID != "" && ex.ExternalID == a.ExternalID && ex.TenantURL == a.TenantURL) {
+			if ex.ID == a.ID ||
+				(a.ExternalID != "" && ex.ExternalID == a.ExternalID && ex.TenantURL == a.TenantURL) ||
+				(a.Email != "" && strings.EqualFold(ex.Email, a.Email) && ex.TenantURL == a.TenantURL) {
 				matched = i
 				break
 			}
 		}
 		if matched >= 0 {
-			// Preserve existing proxy_url if incoming left it empty.
+			// Preserve existing proxy_url and identity fields if incoming left them empty.
 			if a.ProxyURL == "" && existing[matched].ProxyURL != "" {
 				a.ProxyURL = existing[matched].ProxyURL
 			}
-			// Preserve existing ID when matched by ExternalID+TenantURL.
+			if a.Email == "" && existing[matched].Email != "" {
+				a.Email = existing[matched].Email
+			}
+			if a.DisplayName == "" && existing[matched].DisplayName != "" {
+				a.DisplayName = existing[matched].DisplayName
+			}
+			if a.AWSAccountID == "" && existing[matched].AWSAccountID != "" {
+				a.AWSAccountID = existing[matched].AWSAccountID
+			}
+			if a.ExternalID == "" && existing[matched].ExternalID != "" {
+				a.ExternalID = existing[matched].ExternalID
+			}
+			// Preserve existing ID when matched by ExternalID/Email+TenantURL.
 			if existing[matched].ID != "" {
 				a.ID = existing[matched].ID
 			}

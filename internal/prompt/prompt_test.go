@@ -248,3 +248,53 @@ func TestToolStreamParserToolOnlyNoStrayWhitespaceAndParamsFallback(t *testing.T
 		t.Fatalf("unexpected parsed calls: %+v", calls)
 	}
 }
+
+func TestFlexibleReasoningThinkingToolArgsAndAnthropicImage(t *testing.T) {
+	cases := []struct {
+		raw  string
+		want string
+	}{
+		{`{"model":"m","reasoning":"low"}`, "low"},
+		{`{"model":"m","reasoning":false}`, "off"},
+		{`{"model":"m","reasoning":true}`, "high"},
+		{`{"model":"m","thinking":true}`, "high"},
+		{`{"model":"m","thinking":false}`, "off"},
+		{`{"model":"m","thinking":"disabled"}`, "off"},
+		{`{"model":"m","extra_body":{"reasoning":"medium"}}`, "medium"},
+	}
+	for _, tc := range cases {
+		var req ChatCompletionRequest
+		if err := json.Unmarshal([]byte(tc.raw), &req); err != nil {
+			t.Fatalf("unmarshal %s failed: %v", tc.raw, err)
+		}
+		if got := req.EffectiveReasoningEffort(nil); got != tc.want {
+			t.Fatalf("%s: got %q, want %q", tc.raw, got, tc.want)
+		}
+	}
+
+	// ToolCallFunction tolerates raw JSON object and null arguments.
+	var req ChatCompletionRequest
+	rawReq := `{
+		"model": "quick-opus-5.5",
+		"messages": [
+			{"role": "user", "content": [
+				{"type": "text", "text": "Inspect"},
+				{"type": "image", "source": {"type": "base64", "media_type": "image/jpeg", "data": "aGVsbG8="}}
+			]},
+			{"role": "assistant", "content": null, "tool_calls": [
+				{"id": "c1", "type": "function", "function": {"name": "fn_obj", "arguments": {"k": 1}}},
+				{"id": "c2", "type": "function", "function": {"name": "fn_null", "arguments": null}}
+			]}
+		]
+	}`
+	if err := json.Unmarshal([]byte(rawReq), &req); err != nil {
+		t.Fatalf("unmarshal flexible tool args + anthropic image failed: %v", err)
+	}
+	if req.Messages[1].ToolCalls[0].Function.Arguments != `{"k": 1}` || req.Messages[1].ToolCalls[1].Function.Arguments != "" {
+		t.Fatalf("unexpected tool args: %+v", req.Messages[1].ToolCalls)
+	}
+	conv := Convert(req)
+	if len(conv.Images) != 1 || conv.Images[0].MimeType != "image/jpeg" || string(conv.Images[0].Data) != "hello" {
+		t.Fatalf("expected Anthropic-style base64 image extracted, got %+v", conv.Images)
+	}
+}

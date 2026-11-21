@@ -36,6 +36,12 @@ type contentPart struct {
 	Text     string          `json:"text,omitempty"`
 	URL      string          `json:"url,omitempty"`
 	ImageURL json.RawMessage `json:"image_url,omitempty"`
+	Source   *struct {
+		Type      string `json:"type,omitempty"`
+		MediaType string `json:"media_type,omitempty"`
+		Data      string `json:"data,omitempty"`
+		URL       string `json:"url,omitempty"`
+	} `json:"source,omitempty"`
 }
 
 func extractImageURLValue(raw json.RawMessage, fallbackURL string) string {
@@ -77,6 +83,22 @@ func ExtractMessageContent(raw json.RawMessage, imgCounter *int) (string, []Pend
 				if u := extractImageURLValue(p.ImageURL, p.URL); u != "" {
 					if img, ok := parseImageURL(u, imgCounter); ok {
 						imgs = append(imgs, img)
+					}
+				}
+			case "image":
+				if p.Source != nil {
+					if strings.EqualFold(p.Source.Type, "base64") && p.Source.Data != "" {
+						mt := strings.TrimSpace(p.Source.MediaType)
+						if mt == "" {
+							mt = "image/png"
+						}
+						if img, ok := parseImageURL("data:"+mt+";base64,"+p.Source.Data, imgCounter); ok {
+							imgs = append(imgs, img)
+						}
+					} else if u := strings.TrimSpace(p.Source.URL); u != "" {
+						if img, ok := parseImageURL(u, imgCounter); ok {
+							imgs = append(imgs, img)
+						}
 					}
 				}
 			}

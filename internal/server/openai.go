@@ -200,6 +200,11 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 					if q := quick.ParseQuota(u); q != nil {
 						s.store.UpdateQuota(st.ID, q)
 					}
+					if st.Email == "" {
+						idCtx, idCancel := context.WithTimeout(uctx, 6*time.Second)
+						_ = s.manager.FetchIdentity(idCtx, acct)
+						idCancel()
+					}
 				} else {
 					usages[st.ID] = map[string]string{"error": err2.Error()}
 				}

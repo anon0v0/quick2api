@@ -497,6 +497,37 @@
     }).join("");
   }
 
+  function findAccountMeta(id) {
+    const list = (state.status && state.status.accounts) || [];
+    return list.find((a) => a.id === id) || null;
+  }
+
+  function accountFullHint(a) {
+    if (!a) return "";
+    const parts = [];
+    if (a.display_name) parts.push(a.display_name);
+    if (a.email) parts.push(`<${a.email}>`);
+    if (a.id) parts.push(`(${a.id})`);
+    return parts.join(" ");
+  }
+
+  function formatAccountCell(accountID) {
+    if (!accountID) return { label: "-", title: "", sub: "" };
+    const a = findAccountMeta(accountID);
+    if (!a) return { label: accountID, title: accountID, sub: "" };
+    if (a.email) {
+      return {
+        label: a.email,
+        title: accountFullHint(a),
+        sub: a.display_name ? `${a.display_name} · ${a.id}` : a.id,
+      };
+    }
+    if (a.display_name) {
+      return { label: a.display_name, title: accountFullHint(a), sub: a.id };
+    }
+    return { label: a.id, title: a.id, sub: "" };
+  }
+
   /* Overview Accounts Snapshot */
   function renderOverviewAccounts() {
     const el = $("overview-accounts");
@@ -511,10 +542,15 @@
       const monthlyText = q ? `月 ${q.monthly_used}/${q.monthly_limit} (${q.monthly_percent}%)` : "月配额未拉取";
       const sessionText = q ? `会话 ${q.session_used}/${q.session_limit}` : "";
       const proxyText = a.proxy ? a.proxy : "直连";
+      const primary = a.email || a.display_name || a.id;
+      const secondary = a.email && a.display_name ? `${a.display_name} · ${a.id}` : (a.email || a.display_name ? a.id : "");
       return `
         <div class="mini-item">
           <div class="mini-item-top">
-            <span class="mini-id" title="${esc(a.id)}">${esc(a.id)}</span>
+            <div class="mini-ident">
+              <span class="mini-id${a.email || a.display_name ? " is-human" : ""}" title="${esc(accountFullHint(a))}">${esc(primary)}</span>
+              ${secondary ? `<span class="mini-sub mono" title="${esc(secondary)}">${esc(secondary)}</span>` : ""}
+            </div>
             <span class="status-pill ${badge.cls}" data-cd-acct="${esc(a.id)}"><span class="dot"></span>${esc(badge.text)}</span>
           </div>
           <div class="mini-meta mono">
@@ -540,11 +576,12 @@
       const ok = r.status === "ok";
       const pill = ok ? '<span class="status-pill pill-ok">200</span>' : `<span class="status-pill pill-err" title="${esc(r.status)}">${esc(r.http_status || r.status)}</span>`;
       const cacheTag = r.cache_read_tokens > 0 ? ` / <span style="color:var(--cache)">${fmtCompact(r.cache_read_tokens)}</span>` : "";
+      const acctCell = formatAccountCell(r.account_id);
       return `
         <tr>
           <td class="mono">${esc(fmtClock(r.timestamp))}</td>
           <td class="mono">${esc(r.model)}</td>
-          <td class="mono">${esc(r.account_id || "-")}</td>
+          <td class="mono" title="${esc(acctCell.title)}">${esc(acctCell.label)}</td>
           <td class="num mono">${fmtCompact(r.total_tokens)}${cacheTag}</td>
           <td class="num mono">${fmtLatency(r.latency_ms)}</td>
           <td>${pill}</td>
@@ -552,7 +589,6 @@
       `;
     }).join("");
   }
-
   /* Accounts Full Tab */
   function renderAccountsTab() {
     const grid = $("accounts-grid");
@@ -635,15 +671,25 @@
         ? `<span class="acct-probe-pill ${probe.ok ? "ok" : "err"}" title="${esc(probe.ok ? `出口 IP ${probe.ip}` : probe.error)}">${probe.ok ? `${esc(probe.ip)} · ${probe.latency}ms` : "探测失败"}</span>`
         : "";
 
+      const hasName = !!a.display_name;
+      const hasEmail = !!a.email;
+      const primaryTitle = hasName ? a.display_name : (hasEmail ? a.email : a.id);
+      const titleCls = hasName || hasEmail ? "acct-title is-human" : "acct-title";
+      const emailRow = hasName && hasEmail ? `<div class="acct-email" title="${esc(a.email)}">${esc(a.email)}</div>` : "";
+      const subMeta = (hasName || hasEmail)
+        ? `${a.id}${a.tenant_host ? " · " + a.tenant_host : ""}`
+        : (a.tenant_host || "-");
+
       return `
         <article class="acct-card${a.disabled ? " is-disabled" : ""}">
           <div class="acct-head">
             <div class="acct-head-main">
               <div class="acct-title-row">
-                <span class="acct-title">${esc(a.id)}</span>
+                <span class="${titleCls}" title="${esc(accountFullHint(a))}">${esc(primaryTitle)}</span>
                 ${sub.label ? `<span class="acct-sub-badge" title="${esc(sub.raw)}">${esc(sub.label)}</span>` : ""}
               </div>
-              <div class="acct-sub mono" title="${esc(a.tenant_host || "")}">${esc(a.tenant_host || "-")}</div>
+              ${emailRow}
+              <div class="acct-sub mono" title="${esc(subMeta)}">${esc(subMeta)}</div>
             </div>
             <span class="status-pill ${badge.cls}" data-cd-acct="${esc(a.id)}"><span class="dot"></span>${esc(badge.text)}</span>
           </div>
@@ -729,9 +775,14 @@
     if (acctList.length === 0) {
       aBody.innerHTML = '<tr><td colspan="7"><div class="empty-state">暂无账号流量统计</div></td></tr>';
     } else {
-      aBody.innerHTML = acctList.map((a) => `
+      aBody.innerHTML = acctList.map((a) => {
+        const cell = formatAccountCell(a.account_id);
+        return `
         <tr>
-          <td class="mono strong-text">${esc(a.account_id)}</td>
+          <td title="${esc(cell.title)}">
+            <div class="mono strong-text">${esc(cell.label)}</div>
+            ${cell.sub ? `<div class="cell-sub mono">${esc(cell.sub)}</div>` : ""}
+          </td>
           <td class="num mono">${fmtNum(a.requests)}</td>
           <td class="num mono">${fmtNum(a.success)} / ${fmtNum(a.errors)}</td>
           <td class="num mono">${a.rate_limited > 0 ? `<span style="color:var(--warn)">${fmtNum(a.rate_limited)}</span>` : "0"}</td>
@@ -739,7 +790,8 @@
           <td class="num mono">${fmtLatency(a.avg_latency_ms)}</td>
           <td class="num mono">${esc(fmtClock(a.last_used_at))}</td>
         </tr>
-      `).join("");
+      `;
+      }).join("");
     }
 
     // Update model filter options preserving selection
@@ -774,12 +826,13 @@
       if (r.stream) chips.push('<span class="tag-chip">SSE</span>');
       if (r.tool_calls > 0) chips.push(`<span class="tag-chip">tools:${r.tool_calls}</span>`);
       const shortID = (r.id || "").replace(/^chatcmpl-/, "").slice(0, 10) || "-";
+      const acctCell = formatAccountCell(r.account_id);
       return `
         <tr>
           <td class="mono">${esc(fmtClock(r.timestamp))}</td>
           <td class="mono" style="color:var(--ink-muted)" title="${esc(r.id || "")}">${esc(shortID)}</td>
           <td class="mono">${esc(r.model)}</td>
-          <td class="mono">${esc(r.account_id || "-")}</td>
+          <td class="mono" title="${esc(acctCell.title)}">${esc(acctCell.label)}</td>
           <td>${chips.join(" ") || "-"}</td>
           <td class="num mono">${fmtCompact(r.input_tokens)} / <span style="color:var(--cache)">${fmtCompact(r.cache_read_tokens)}</span> / ${fmtCompact(r.output_tokens)}</td>
           <td class="num mono">${fmtLatency(r.latency_ms)}</td>

@@ -240,6 +240,13 @@ func (m *Manager) getOrDialConn(ctx context.Context, acct auth.Account) (*accoun
 	return c, nil
 }
 
+// FetchIdentity opens (or reuses) an account's persistent AIDP WebSocket so the
+// `connected` frame populates the account's real Email & DisplayName in the store.
+func (m *Manager) FetchIdentity(ctx context.Context, acct auth.Account) error {
+	_, err := m.getOrDialConn(ctx, acct)
+	return err
+}
+
 // StreamTurn executes a chat turn on acct and streams normalized events to the returned channel.
 // Oversized prompts (> MaxInnerUserMessageBytes) are automatically staged across multiple
 // sequential turns on the same thread_id so SNCS never rejects them with FrameTooLarge.
@@ -955,9 +962,9 @@ type accountConn struct {
 	debug       bool
 	ws          *websocket.Conn
 	onClose     func()
+	onIdentity  func(email, displayName, awsAccountID, externalID string)
 
 	writeMu sync.Mutex
-
 	mu      sync.Mutex
 	alive   bool
 	threads map[string]*threadSub
@@ -1024,7 +1031,11 @@ func (m *Manager) dialAccountConn(ctx context.Context, acct auth.Account) (*acco
 		}
 		m.mu.Unlock()
 	}
-
+	ac.onIdentity = func(email, displayName, awsAccountID, externalID string) {
+		if m.store != nil {
+			m.store.UpdateProfile(acct.ID, email, displayName, awsAccountID, externalID)
+		}
+	}
 	if err := ac.sendJSON(map[string]any{
 		"type": "session_connect",
 		"payload": map[string]any{
@@ -1210,10 +1221,14 @@ func (c *accountConn) readLoop(connectedCh chan<- error) {
 			}
 
 			if env.Type == "connected" {
+				if email, name, awsAcctID, extID := parseConnectedUserProfile(env.Payload); email != "" || name != "" || awsAcctID != "" || extID != "" {
+					if c.onIdentity != nil {
+						c.onIdentity(email, name, awsAcctID, extID)
+					}
+				}
 				notifyConnected(nil)
 				continue
 			}
-
 			threadID := env.ThreadID
 			if threadID == "" {
 				threadID = env.SessionID
@@ -1386,4 +1401,36 @@ func truncate(s string, max int) string {
 		return s
 	}
 	return s[:max] + "..."
+}
+
+// parseConnectedUserProfile extracts identity metadata from Quick's WS `connected` payload.user.
+func parseConnectedUserProfile(rawPayload json.RawMessage) (email, displayName, awsAccountID, externalID string) {
+	if len(rawPayload) == 0 {
+		return "", "", "", ""
+	}
+	var p struct {
+		User *struct {
+			Sub          string `json:"sub"`
+			Email        string `json:"email"`
+			Name         string `json:"name"`
+			FirstName    string `json:"first_name"`
+			LastName     string `json:"last_name"`
+			AWSAccountID string `json:"aws_account_id"`
+			ExternalID   string `json:"external_id"`
+		} `json:"user"`
+	}
+	if err := json.Unmarshal(rawPayload, &p); err != nil || p.User == nil {
+		return "", "", "", ""
+	}
+	email = strings.TrimSpace(p.User.Email)
+	displayName = strings.TrimSpace(p.User.Name)
+	if displayName == "" {
+		displayName = strings.TrimSpace(strings.TrimSpace(p.User.FirstName) + " " + strings.TrimSpace(p.User.LastName))
+	}
+	awsAccountID = strings.TrimSpace(p.User.AWSAccountID)
+	externalID = strings.TrimSpace(p.User.ExternalID)
+	if externalID == "" {
+		externalID = strings.TrimSpace(p.User.Sub)
+	}
+	return email, displayName, awsAccountID, externalID
 }

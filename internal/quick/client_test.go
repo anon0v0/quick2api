@@ -531,3 +531,18 @@ func TestStreamTurnMultiTurnStagingOverMockWS(t *testing.T) {
 		t.Fatalf("expected exactly 1 session_delete after all staged turns, got %d", seenDeletes)
 	}
 }
+
+func TestParseConnectedUserProfile(t *testing.T) {
+	raw := json.RawMessage(`{"client_id":"1","user":{"sub":"sub-1","email":"alice@example.com","name":"Alice Chen","aws_account_id":"123456789012","external_id":"ext-1"}}`)
+	email, name, awsID, extID := parseConnectedUserProfile(raw)
+	if email != "alice@example.com" || name != "Alice Chen" || awsID != "123456789012" || extID != "ext-1" {
+		t.Fatalf("unexpected profile: email=%q name=%q awsID=%q extID=%q", email, name, awsID, extID)
+	}
+
+	// Fallback to first_name + last_name and sub when name/external_id are empty.
+	raw2 := json.RawMessage(`{"user":{"sub":"sub-2","email":"bob@example.com","first_name":"Bob","last_name":"Lee"}}`)
+	email, name, _, extID = parseConnectedUserProfile(raw2)
+	if email != "bob@example.com" || name != "Bob Lee" || extID != "sub-2" {
+		t.Fatalf("unexpected fallback profile: email=%q name=%q extID=%q", email, name, extID)
+	}
+}

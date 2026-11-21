@@ -447,7 +447,7 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 	}
 	consumed = true
 
-	// Best-effort 5s usage probe to immediately populate quota snapshot on the new card.
+	// Best-effort usage + identity probes to immediately populate quota & email/name on the new card.
 	usageOK := false
 	usageNote := ""
 	uCtx, uCancel := context.WithTimeout(r.Context(), 5*time.Second)
@@ -457,6 +457,11 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 		if q := quick.ParseQuota(rawUsage); q != nil {
 			s.store.UpdateQuota(acct.ID, q)
 			usageOK = true
+		}
+		if acct.Email == "" {
+			idCtx, idCancel := context.WithTimeout(r.Context(), 6*time.Second)
+			_ = s.manager.FetchIdentity(idCtx, acct)
+			idCancel()
 		}
 	} else {
 		usageNote = uErr.Error()
@@ -526,8 +531,21 @@ func (s *Server) handleAdminAccountImport(w http.ResponseWriter, r *http.Request
 		return
 	}
 	if _, err := s.ReloadAccounts(); err != nil {
-		writeOpenAIError(w, http.StatusInternalServerError, "reload_failed", "api_error", err.Error())
+		writeOpenAIError(w, http.StatusInternalServerError, "reload_failed", "api_error", fmt.Sprintf("Saved accounts but reload failed: %v", err))
 		return
+	}
+	// Best-effort identity backfill for newly imported accounts missing email (bounded to first 5).
+	probed := 0
+	for _, a := range incoming {
+		if a.Disabled || a.Email != "" || probed >= 5 {
+			continue
+		}
+		probed++
+		if liveAcct, ok := s.store.GetAccount(a.ID); ok && liveAcct.Email == "" {
+			idCtx, idCancel := context.WithTimeout(r.Context(), 4*time.Second)
+			_ = s.manager.FetchIdentity(idCtx, liveAcct)
+			idCancel()
+		}
 	}
 	log.Printf("[admin] imported %d account(s) via web ui added=%v updated=%v", len(incoming), added, updated)
 	writeJSON(w, http.StatusOK, map[string]any{

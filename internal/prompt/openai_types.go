@@ -17,8 +17,8 @@ type ChatCompletionRequest struct {
 	FunctionCall         json.RawMessage            `json:"function_call,omitempty"`
 	ReasoningEffort      string                     `json:"reasoning_effort,omitempty"`
 	ReasoningEffortCamel string                     `json:"reasoningEffort,omitempty"`
-	Reasoning            *ReasoningConfig           `json:"reasoning,omitempty"`
-	Thinking             *ThinkingConfig            `json:"thinking,omitempty"`
+	Reasoning            json.RawMessage            `json:"reasoning,omitempty"`
+	Thinking             json.RawMessage            `json:"thinking,omitempty"`
 	ExtraBody            map[string]json.RawMessage `json:"extra_body,omitempty"`
 	MaxTokens            *int                       `json:"max_tokens,omitempty"`
 	MaxCompletionTokens  *int                       `json:"max_completion_tokens,omitempty"`
@@ -42,6 +42,81 @@ type ThinkingConfig struct {
 	BudgetTokens *int   `json:"budget_tokens,omitempty"`
 }
 
+func parseReasoningRaw(raw json.RawMessage, budgetToEffort func(int) string) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		return strings.TrimSpace(s)
+	}
+	var b bool
+	if json.Unmarshal(raw, &b) == nil {
+		if !b {
+			return "off"
+		}
+		return "high"
+	}
+	var rc ReasoningConfig
+	if json.Unmarshal(raw, &rc) == nil {
+		if s := strings.TrimSpace(rc.Effort); s != "" {
+			return s
+		}
+		if rc.Enabled != nil {
+			if !*rc.Enabled {
+				return "off"
+			}
+			if rc.MaxTokens != nil && budgetToEffort != nil {
+				return budgetToEffort(*rc.MaxTokens)
+			}
+			return "high"
+		}
+		if rc.MaxTokens != nil && budgetToEffort != nil {
+			return budgetToEffort(*rc.MaxTokens)
+		}
+	}
+	return ""
+}
+
+func parseThinkingRaw(raw json.RawMessage, budgetToEffort func(int) string) string {
+	trimmed := strings.TrimSpace(string(raw))
+	if trimmed == "" || trimmed == "null" {
+		return ""
+	}
+	var b bool
+	if json.Unmarshal(raw, &b) == nil {
+		if !b {
+			return "off"
+		}
+		return "high"
+	}
+	var s string
+	if json.Unmarshal(raw, &s) == nil {
+		switch strings.ToLower(strings.TrimSpace(s)) {
+		case "disabled", "none", "off", "false":
+			return "off"
+		case "enabled", "adaptive", "true":
+			return "high"
+		default:
+			return strings.TrimSpace(s)
+		}
+	}
+	var tc ThinkingConfig
+	if json.Unmarshal(raw, &tc) == nil {
+		switch strings.ToLower(strings.TrimSpace(tc.Type)) {
+		case "disabled", "none", "off":
+			return "off"
+		case "enabled", "adaptive":
+			if tc.BudgetTokens != nil && budgetToEffort != nil {
+				return budgetToEffort(*tc.BudgetTokens)
+			}
+			return "high"
+		}
+	}
+	return ""
+}
+
 // EffectiveReasoningEffort extracts a normalized reasoning/thinking directive from
 // reasoning_effort, reasoningEffort, reasoning, thinking, and extra_body fields.
 func (r ChatCompletionRequest) EffectiveReasoningEffort(budgetToEffort func(int) string) string {
@@ -51,33 +126,11 @@ func (r ChatCompletionRequest) EffectiveReasoningEffort(budgetToEffort func(int)
 	if s := strings.TrimSpace(r.ReasoningEffortCamel); s != "" {
 		return s
 	}
-	if r.Reasoning != nil {
-		if s := strings.TrimSpace(r.Reasoning.Effort); s != "" {
-			return s
-		}
-		if r.Reasoning.Enabled != nil {
-			if !*r.Reasoning.Enabled {
-				return "off"
-			}
-			if r.Reasoning.MaxTokens != nil && budgetToEffort != nil {
-				return budgetToEffort(*r.Reasoning.MaxTokens)
-			}
-			return "high"
-		}
-		if r.Reasoning.MaxTokens != nil && budgetToEffort != nil {
-			return budgetToEffort(*r.Reasoning.MaxTokens)
-		}
+	if eff := parseReasoningRaw(r.Reasoning, budgetToEffort); eff != "" {
+		return eff
 	}
-	if r.Thinking != nil {
-		switch strings.ToLower(strings.TrimSpace(r.Thinking.Type)) {
-		case "disabled", "none", "off":
-			return "off"
-		case "enabled", "adaptive":
-			if r.Thinking.BudgetTokens != nil && budgetToEffort != nil {
-				return budgetToEffort(*r.Thinking.BudgetTokens)
-			}
-			return "high"
-		}
+	if eff := parseThinkingRaw(r.Thinking, budgetToEffort); eff != "" {
+		return eff
 	}
 	if len(r.ExtraBody) > 0 {
 		for _, k := range []string{"reasoning_effort", "reasoningEffort"} {
@@ -89,21 +142,13 @@ func (r ChatCompletionRequest) EffectiveReasoningEffort(budgetToEffort func(int)
 			}
 		}
 		if raw, ok := r.ExtraBody["reasoning"]; ok {
-			var rc ReasoningConfig
-			if json.Unmarshal(raw, &rc) == nil {
-				sub := ChatCompletionRequest{Reasoning: &rc}
-				if eff := sub.EffectiveReasoningEffort(budgetToEffort); eff != "" {
-					return eff
-				}
+			if eff := parseReasoningRaw(raw, budgetToEffort); eff != "" {
+				return eff
 			}
 		}
 		if raw, ok := r.ExtraBody["thinking"]; ok {
-			var tc ThinkingConfig
-			if json.Unmarshal(raw, &tc) == nil {
-				sub := ChatCompletionRequest{Thinking: &tc}
-				if eff := sub.EffectiveReasoningEffort(budgetToEffort); eff != "" {
-					return eff
-				}
+			if eff := parseThinkingRaw(raw, budgetToEffort); eff != "" {
+				return eff
 			}
 		}
 	}
@@ -148,6 +193,31 @@ type ToolCall struct {
 type ToolCallFunction struct {
 	Name      string `json:"name,omitempty"`
 	Arguments string `json:"arguments"`
+}
+
+// UnmarshalJSON tolerates both OpenAI string `arguments` and raw JSON object/null
+// arguments occasionally forwarded by third-party proxies.
+func (f *ToolCallFunction) UnmarshalJSON(data []byte) error {
+	var raw struct {
+		Name      string          `json:"name"`
+		Arguments json.RawMessage `json:"arguments"`
+	}
+	if err := json.Unmarshal(data, &raw); err != nil {
+		return err
+	}
+	f.Name = raw.Name
+	trimmed := strings.TrimSpace(string(raw.Arguments))
+	if trimmed == "" || trimmed == "null" {
+		f.Arguments = ""
+		return nil
+	}
+	var s string
+	if err := json.Unmarshal(raw.Arguments, &s); err == nil {
+		f.Arguments = s
+		return nil
+	}
+	f.Arguments = trimmed
+	return nil
 }
 // ParseStopSequences parses OpenAI `stop` which can be a single string or []string.
 func ParseStopSequences(raw json.RawMessage) []string {

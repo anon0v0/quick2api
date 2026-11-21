@@ -126,13 +126,8 @@ func TestReassembleDesktopCredentialsChunkedAndSingle(t *testing.T) {
 		if a.ProxyURL != "socks5h://127.0.0.1:1080" {
 			t.Fatalf("expected proxy assigned, got %q", a.ProxyURL)
 		}
-		if a.ID == "social-abc123" && a.AccessToken == "aoa_1" && a.RefreshToken == "aor_1" && a.ExternalID == "ext-1" {
+		if a.ID == "social-abc123" && a.AccessToken == "aoa_1" && a.RefreshToken == "aor_1" && a.ExternalID == "ext-1" && a.Email == "hidden@example.com" {
 			foundChunked = true
-		}
-		// Ensure email PII is not serialized on Account.
-		b, _ := json.Marshal(a)
-		if strings.Contains(string(b), "hidden@example.com") {
-			t.Fatalf("PII email must not be persisted in Account JSON: %s", string(b))
 		}
 	}
 	if !foundChunked {

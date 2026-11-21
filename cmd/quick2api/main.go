@@ -77,11 +77,33 @@ func main() {
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
 	store.StartBackgroundRefresher(bgCtx)
+	// Best-effort startup backfill: discover email/display_name for any enabled account missing it.
+	go func() {
+		select {
+		case <-bgCtx.Done():
+			return
+		case <-time.After(1 * time.Second):
+		}
+		for _, acct := range store.AccountsSnapshot() {
+			if acct.Disabled || acct.Email != "" {
+				continue
+			}
+			if bgCtx.Err() != nil {
+				return
+			}
+			pctx, pcancel := context.WithTimeout(bgCtx, 12*time.Second)
+			fresh, err := store.EnsureFresh(pctx, acct.ID, false)
+			if err == nil {
+				_ = manager.FetchIdentity(pctx, fresh)
+			}
+			pcancel()
+		}
+	}()
 
 	handler := server.New(cfg, store, manager)
 	handler.SetLogBuffer(logBuf)
-	watchReloadSignal(bgCtx, handler.ReloadAccounts)
 	httpServers := make([]*http.Server, 0, len(cfg.ListenAddrs))
+	watchReloadSignal(bgCtx, handler.ReloadAccounts)
 	var wg sync.WaitGroup
 
 	for _, addr := range cfg.ListenAddrs {
