@@ -227,6 +227,12 @@ func TestConvertToolChoiceRepackAndCacheOrder(t *testing.T) {
 	if !(idxC1 >= 0 && idxC1 < idxC2 && idxC2 < idxNotice) {
 		t.Fatalf("expected repacked contiguous tool results with backfilled names, got:\n%s", conv.Text)
 	}
+	if !strings.Contains(conv.CompactCustomPrompt, "<quick_tool_call>") || !strings.Contains(conv.CompactCustomPrompt, "[Tool Choice = REQUIRED]") || !strings.Contains(conv.CompactCustomPrompt, "[Output Format]") {
+		t.Fatalf("CompactCustomPrompt missing required directives: %s", conv.CompactCustomPrompt)
+	}
+	if strings.Contains(conv.CompactCustomPrompt, "BASE_SYSTEM_PROMPT") {
+		t.Fatalf("CompactCustomPrompt should stay compact and omit full leading system prompt: %s", conv.CompactCustomPrompt)
+	}
 }
 
 func TestToolStreamParserToolOnlyNoStrayWhitespaceAndParamsFallback(t *testing.T) {

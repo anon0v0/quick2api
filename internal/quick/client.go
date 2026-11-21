@@ -38,6 +38,7 @@ type Attachment struct {
 	Name          string `json:"name"`
 	Size          int    `json:"size"`
 	MimeType      string `json:"mimeType"`
+	Path          string `json:"path,omitempty"`
 	AttachmentID  string `json:"attachmentId,omitempty"`
 	ContentSha256 string `json:"contentSha256,omitempty"`
 	Data          string `json:"data,omitempty"`
@@ -45,15 +46,16 @@ type Attachment struct {
 
 // TurnRequest holds all parameters to start one Quick chat turn.
 type TurnRequest struct {
-	ThreadID       string
-	Text           string
-	CustomPrompt   string
-	AgentMode      string
-	ThinkingEffort string
-	Attachments    []Attachment
-	SurfaceType    string
+	ThreadID            string
+	Text                string
+	CustomPrompt        string
+	CompactCustomPrompt string
+	StageableCustomBody string
+	AgentMode           string
+	ThinkingEffort      string
+	Attachments         []Attachment
+	SurfaceType         string
 }
-
 // TurnUsage holds token and model metadata emitted by Quick's turn_usage frame.
 type TurnUsage struct {
 	InputTokens      int     `json:"input_tokens"`
@@ -70,14 +72,15 @@ type TurnUsage struct {
 
 // StreamEvent represents a single normalized event delivered to a turn consumer.
 type StreamEvent struct {
-	Kind      string // "text_delta", "thinking_delta", "turn_usage", "complete", "error", "guardrail_blocked", "usage_blocked", "rate_limited", "tool_start"
-	Text      string
-	Usage     *TurnUsage
-	ErrorCode string
-	ErrorMsg  string
-	ToolName  string
+	Kind        string // "text_delta", "thinking_delta", "turn_usage", "complete", "error", "guardrail_blocked", "usage_blocked", "rate_limited", "tool_start"
+	Text        string
+	Usage       *TurnUsage
+	ErrorCode   string
+	ErrorMsg    string
+	Retryable   bool
+	FailedFrame string
+	ToolName    string
 }
-
 // Manager manages per-account persistent AIDP WebSocket connections and REST calls.
 type Manager struct {
 	store         *auth.Store
@@ -238,12 +241,9 @@ func (m *Manager) getOrDialConn(ctx context.Context, acct auth.Account) (*accoun
 }
 
 // StreamTurn executes a chat turn on acct and streams normalized events to the returned channel.
+// Oversized prompts (> MaxInnerUserMessageBytes) are automatically staged across multiple
+// sequential turns on the same thread_id so SNCS never rejects them with FrameTooLarge.
 func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnRequest) (<-chan StreamEvent, error) {
-	conn, err := m.getOrDialConn(ctx, acct)
-	if err != nil {
-		return nil, err
-	}
-
 	threadID := req.ThreadID
 	if threadID == "" {
 		threadID = NewUUID()
@@ -253,36 +253,25 @@ func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnReq
 		surface = m.surfaceType
 	}
 
+	turns, rawInnerBytes, err := PlanTurnFrames(req, surface, MaxInnerUserMessageBytes)
+	if err != nil {
+		return nil, err
+	}
+
+	conn, err := m.getOrDialConn(ctx, acct)
+	if err != nil {
+		return nil, err
+	}
+
 	ch := conn.registerThread(threadID)
-
-	payload := map[string]any{
-		"traceId":            NewUUID(),
-		"text":               req.Text,
-		"message_id":         NewUUID(),
-		"thread_id":          threadID,
-		"agent_mode":         req.AgentMode,
-		"thinking_effort":    req.ThinkingEffort,
-		"auto_routing":       false,
-		"web_search_enabled": false,
-		"chat_agent_id":      nil,
-		"user_timezone":      "UTC",
-		"user_locale":        "en-US",
-		"surfaceType":        surface,
-	}
-	if req.CustomPrompt != "" {
-		payload["custom_prompt"] = req.CustomPrompt
-	} else {
-		payload["custom_prompt"] = nil
-	}
-	if len(req.Attachments) > 0 {
-		payload["attachments"] = req.Attachments
+	if len(turns) > 1 {
+		log.Printf("[quick-ws] staging oversized prompt account=%s thread=%s inner_bytes=%d parts=%d",
+			acct.ID, threadID, rawInnerBytes, len(turns))
 	}
 
-	frame := map[string]any{
-		"type":    "user_message",
-		"payload": payload,
-	}
-	if err := conn.sendJSON(frame); err != nil {
+	first := turns[0]
+	firstFrame := buildUserMessageFrame(threadID, surface, req.AgentMode, first.ThinkingEffort, first.CustomPrompt, first.Text, first.Attachments)
+	if err := conn.sendJSON(firstFrame); err != nil {
 		conn.unregisterThread(threadID)
 		m.InvalidateConn(acct.ID)
 		return nil, fmt.Errorf("send user_message: %w", err)
@@ -312,6 +301,8 @@ func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnReq
 			}
 		}
 
+		stageIdx := 0
+		lastIdx := len(turns) - 1
 		sawUsage := false
 		completed := false
 		var drainTimer *time.Timer
@@ -372,7 +363,7 @@ func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnReq
 				return
 
 			case <-idleCh:
-				if completed {
+				if completed && stageIdx == lastIdx {
 					emit(StreamEvent{Kind: "complete"})
 					return
 				}
@@ -395,14 +386,38 @@ func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnReq
 
 			case ev, ok := <-ch:
 				if !ok {
-					if completed {
+					if completed && stageIdx == lastIdx {
 						emit(StreamEvent{Kind: "complete"})
 						return
 					}
-					emit(StreamEvent{Kind: "error", ErrorCode: "stream_closed", ErrorMsg: "upstream WebSocket closed before message_complete"})
+					emit(StreamEvent{Kind: "error", ErrorCode: "stream_closed", ErrorMsg: "upstream WebSocket closed before message_complete", Retryable: true})
 					return
 				}
 				resetIdle()
+
+				// Staging turns (0 .. lastIdx-1): consume acknowledgment internally and advance to next part.
+				if stageIdx < lastIdx {
+					switch ev.Kind {
+					case "error", "guardrail_blocked", "usage_blocked", "rate_limited":
+						emit(ev)
+						return
+					case "complete":
+						stageIdx++
+						nextTurn := turns[stageIdx]
+						nextFrame := buildUserMessageFrame(threadID, surface, req.AgentMode, nextTurn.ThinkingEffort, nextTurn.CustomPrompt, nextTurn.Text, nextTurn.Attachments)
+						if err := conn.sendJSON(nextFrame); err != nil {
+							m.InvalidateConn(acct.ID)
+							emit(StreamEvent{
+								Kind:      "error",
+								ErrorCode: "stream_closed",
+								ErrorMsg:  fmt.Sprintf("send staged part %d/%d: %v", stageIdx+1, len(turns), err),
+								Retryable: true,
+							})
+							return
+						}
+					}
+					continue
+				}
 
 				switch ev.Kind {
 				case "turn_usage":
@@ -681,6 +696,213 @@ func (m *Manager) UploadAttachment(ctx context.Context, acct auth.Account, name,
 		AttachmentID:  parsed.AttachmentID,
 		ContentSha256: shaHex,
 	}, nil
+}
+
+// UploadAndDeliverAttachment runs the official 3-step Amazon Quick cloud attachment flow:
+// 1. POST /integration/quick-work/upload-attachment -> attachmentId
+// 2. Poll GET /integration/quick-work/attachment-dlp-status?attachmentId= -> ALLOW
+// 3. POST /integration/quick-work/qbs-event (invokeAgent files/upload/{threadID}) -> server path
+// Without steps 2-3, Quick's cloud agent cannot read the uploaded attachment bytes.
+func (m *Manager) UploadAndDeliverAttachment(ctx context.Context, acct auth.Account, threadID, name, mimeType string, data []byte) (Attachment, error) {
+	att, err := m.UploadAttachment(ctx, acct, name, mimeType, data)
+	if err != nil {
+		return Attachment{}, err
+	}
+	if err := m.waitAttachmentDLP(ctx, acct, att.AttachmentID); err != nil {
+		return Attachment{}, err
+	}
+	if strings.TrimSpace(threadID) != "" {
+		serverPath, err := m.deliverAttachmentToSession(ctx, acct, threadID, att.AttachmentID)
+		if err != nil {
+			return Attachment{}, err
+		}
+		att.Path = serverPath
+	}
+	return att, nil
+}
+
+func (m *Manager) waitAttachmentDLP(ctx context.Context, acct auth.Account, attachmentID string) error {
+	effProxy := m.effectiveProxy(acct)
+	hc, err := m.httpClientForProxy(effProxy)
+	if err != nil {
+		return err
+	}
+	q := url.Values{}
+	q.Set("attachmentId", attachmentID)
+	endpoint := fmt.Sprintf("%s/integration/quick-work/attachment-dlp-status?%s", acct.TenantURL, q.Encode())
+
+	deadline := time.Now().Add(15 * time.Second)
+	for attempt := 0; attempt < 30; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodGet, endpoint, nil)
+		if err != nil {
+			return err
+		}
+		req.Header.Set("Authorization", "Bearer "+acct.AccessToken)
+		req.Header.Set("x-amzn-qs-internal-trace-id", NewUUID())
+		resp, err := hc.Do(req)
+		if err != nil {
+			return netproxy.SanitizeError(err, effProxy)
+		}
+		raw, rerr := io.ReadAll(io.LimitReader(resp.Body, 256<<10))
+		resp.Body.Close()
+		if rerr != nil {
+			return rerr
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return &AuthError{Status: resp.StatusCode, Msg: string(raw)}
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return fmt.Errorf("attachment-dlp-status failed (%d): %s", resp.StatusCode, truncate(string(raw), 240))
+		}
+		var parsed map[string]any
+		if err := json.Unmarshal(raw, &parsed); err != nil {
+			return fmt.Errorf("attachment-dlp-status invalid JSON: %w", err)
+		}
+		status := strings.ToUpper(strField(parsed, "dlpJobStatus", "DlpJobStatus"))
+		action := strings.ToUpper(strField(parsed, "policyAction", "PolicyAction"))
+		switch status {
+		case "COMPLETED", "SKIPPED", "NOT_APPLICABLE":
+			if action == "" || action == "ALLOW" || action == "WARN" {
+				return nil
+			}
+			policyMsg := strField(parsed, "dlpPolicyMessage", "policyMessage")
+			if policyMsg == "" {
+				policyMsg = "attachment blocked by AWS Quick DLP policy (" + action + ")"
+			}
+			return errors.New(policyMsg)
+		case "FAILED", "ERROR":
+			return fmt.Errorf("attachment DLP scan failed (%s)", status)
+		}
+		if time.Now().After(deadline) {
+			return errors.New("attachment DLP scan timed out")
+		}
+		delay := 300 * time.Millisecond
+		if attempt >= 4 {
+			delay = 500 * time.Millisecond
+		}
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(delay):
+		}
+	}
+	return errors.New("attachment DLP scan did not complete")
+}
+
+func (m *Manager) deliverAttachmentToSession(ctx context.Context, acct auth.Account, threadID, attachmentID string) (string, error) {
+	env := map[string]any{
+		"eventType": "invokeAgent",
+		"eventBody": map[string]any{
+			"invokeAgent": map[string]any{
+				"path": "files/upload/" + url.PathEscape(threadID),
+				"queryParams": map[string]string{
+					"_method":     "POST",
+					"surfaceType": m.surfaceType,
+				},
+				"body": map[string]any{
+					"attachmentId": attachmentID,
+				},
+			},
+		},
+	}
+	rawBody, err := json.Marshal(env)
+	if err != nil {
+		return "", err
+	}
+	effProxy := m.effectiveProxy(acct)
+	hc, err := m.httpClientForProxy(effProxy)
+	if err != nil {
+		return "", err
+	}
+	var lastErr error
+	for attempt := 0; attempt < 2; attempt++ {
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, acct.TenantURL+"/integration/quick-work/qbs-event", bytes.NewReader(rawBody))
+		if err != nil {
+			return "", err
+		}
+		req.Header.Set("Content-Type", "application/json")
+		req.Header.Set("Authorization", "Bearer "+acct.AccessToken)
+		req.Header.Set("x-amzn-qs-internal-trace-id", NewUUID())
+		resp, err := hc.Do(req)
+		if err != nil {
+			lastErr = netproxy.SanitizeError(err, effProxy)
+			continue
+		}
+		body, rerr := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+		resp.Body.Close()
+		if rerr != nil {
+			lastErr = rerr
+			continue
+		}
+		if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
+			return "", &AuthError{Status: resp.StatusCode, Msg: string(body)}
+		}
+		if resp.StatusCode >= 500 && attempt == 0 {
+			lastErr = fmt.Errorf("files/upload failed (%d): %s", resp.StatusCode, truncate(string(body), 240))
+			continue
+		}
+		if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+			return "", fmt.Errorf("files/upload failed (%d): %s", resp.StatusCode, truncate(string(body), 240))
+		}
+		serverPath, perr := parseDeliveredAttachmentPath(body)
+		if perr != nil {
+			return "", perr
+		}
+		return serverPath, nil
+	}
+	if lastErr != nil {
+		return "", lastErr
+	}
+	return "", errors.New("files/upload delivery failed")
+}
+
+func parseDeliveredAttachmentPath(raw []byte) (string, error) {
+	var outer map[string]any
+	if err := json.Unmarshal(raw, &outer); err != nil {
+		return "", fmt.Errorf("files/upload invalid JSON: %w", err)
+	}
+	if em := strField(outer, "errorMessage"); em != "" {
+		return "", fmt.Errorf("files/upload rejected: %s", em)
+	}
+	var inner any = outer
+	if er, ok := outer["eventResponse"].(map[string]any); ok {
+		if iar, ok := er["invokeAgentResponse"]; ok && iar != nil {
+			inner = iar
+		}
+	}
+	if s, ok := inner.(string); ok {
+		var m2 map[string]any
+		if err := json.Unmarshal([]byte(s), &m2); err == nil {
+			inner = m2
+		}
+	}
+	if m2, ok := inner.(map[string]any); ok {
+		if m2["type"] == "api_response" {
+			if st := toInt(m2["status"]); st >= 400 {
+				return "", fmt.Errorf("files/upload api_response error (%d): %s", st, truncate(strField(m2, "body", "error", "message"), 240))
+			}
+			if bs, ok := m2["body"].(string); ok {
+				var m3 map[string]any
+				if err := json.Unmarshal([]byte(bs), &m3); err == nil {
+					m2 = m3
+				}
+			}
+		}
+		if p := strField(m2, "path"); p != "" {
+			return p, nil
+		}
+		if files, ok := m2["files"].([]any); ok && len(files) > 0 {
+			if f0, ok := files[0].(map[string]any); ok {
+				if p := strField(f0, "path"); p != "" {
+					return p, nil
+				}
+			}
+		}
+		if errStr := strField(m2, "error", "message"); errStr != "" {
+			return "", fmt.Errorf("files/upload error: %s", errStr)
+		}
+	}
+	return "", fmt.Errorf("files/upload did not return a path: %s", truncate(string(raw), 240))
 }
 
 // ---------------------------------------------------------------------------
@@ -1032,6 +1254,23 @@ func (c *accountConn) readLoop(connectedCh chan<- error) {
 				continue
 			}
 
+			if env.Type == "error" {
+				ev, ignore, _, summary := parseQuickErrorEvent(frame.RawJSON, payloadMap)
+				if ignore {
+					if c.debug {
+						log.Printf("[quick-ws] ignoring background error account=%s thread=%s %s", c.accountID, threadID, summary)
+					}
+					continue
+				}
+				log.Printf("[quick-ws] upstream error account=%s thread=%s %s", c.accountID, threadID, summary)
+				if threadID != "" {
+					c.dispatch(threadID, ev)
+				} else {
+					c.dispatchUnscopedError(ev)
+				}
+				continue
+			}
+
 			if threadID == "" {
 				continue
 			}
@@ -1061,49 +1300,27 @@ func (c *accountConn) readLoop(connectedCh chan<- error) {
 				tname, _ := payloadMap["tool_name"].(string)
 				ev = &StreamEvent{Kind: "tool_start", ToolName: tname}
 			case "guardrail_blocked":
-				msg, _ := payloadMap["message"].(string)
+				msg := strField(payloadMap, "message", "error")
 				if msg == "" {
 					msg = "Content blocked by AWS Quick automated guardrail."
 				}
-				reason, _ := payloadMap["reason"].(string)
+				reason := strField(payloadMap, "reason", "code")
+				log.Printf("[quick-ws] guardrail_blocked account=%s thread=%s reason=%s msg=%q", c.accountID, threadID, reason, truncate(msg, 200))
 				ev = &StreamEvent{Kind: "guardrail_blocked", ErrorCode: reason, ErrorMsg: msg}
 			case "usage_blocked":
-				msg, _ := payloadMap["message"].(string)
+				msg := strField(payloadMap, "message", "error")
 				if msg == "" {
 					msg = "Amazon Quick usage limit reached."
 				}
+				log.Printf("[quick-ws] usage_blocked account=%s thread=%s msg=%q", c.accountID, threadID, truncate(msg, 200))
 				ev = &StreamEvent{Kind: "usage_blocked", ErrorCode: "usage_blocked", ErrorMsg: msg}
 			case "rate_limited":
-				msg, _ := payloadMap["message"].(string)
+				msg := strField(payloadMap, "message", "error")
 				if msg == "" {
 					msg = "Amazon Quick rate limit reached."
 				}
+				log.Printf("[quick-ws] rate_limited account=%s thread=%s msg=%q", c.accountID, threadID, truncate(msg, 200))
 				ev = &StreamEvent{Kind: "rate_limited", ErrorCode: "rate_limited", ErrorMsg: msg}
-			case "error":
-				msg, _ := payloadMap["error"].(string)
-				if msg == "" {
-					msg, _ = payloadMap["message"].(string)
-				}
-				if msg == "" {
-					msg = "Unknown upstream Quick error"
-				}
-				code, _ := payloadMap["error_code"].(string)
-				if code == "" {
-					code, _ = payloadMap["error_type"].(string)
-				}
-				if code == "" {
-					code, _ = payloadMap["code"].(string)
-				}
-				kind := "error"
-				lower := strings.ToLower(code + " " + msg)
-				if strings.Contains(lower, "usage") && strings.Contains(lower, "limit") {
-					kind = "usage_blocked"
-				} else if strings.Contains(lower, "rate_limit") || strings.Contains(lower, "throttl") {
-					kind = "rate_limited"
-				} else if code == "content_filtered" {
-					kind = "guardrail_blocked"
-				}
-				ev = &StreamEvent{Kind: kind, ErrorCode: code, ErrorMsg: msg}
 			}
 
 			if ev != nil {
@@ -1125,6 +1342,35 @@ func (c *accountConn) dispatch(threadID string, ev StreamEvent) {
 	sub.send(ev, important)
 }
 
+// dispatchUnscopedError routes a connection-level error frame (no thread_id) to active
+// turn subscribers when the error is fatal/connection-wide or only a single turn is waiting,
+// preventing turns from hanging until idle timeout.
+func (c *accountConn) dispatchUnscopedError(ev StreamEvent) {
+	c.mu.Lock()
+	subs := make([]*threadSub, 0, len(c.threads))
+	for _, sub := range c.threads {
+		if sub != nil {
+			subs = append(subs, sub)
+		}
+	}
+	c.mu.Unlock()
+	if len(subs) == 0 {
+		return
+	}
+	lowerCode := strings.ToLower(ev.ErrorCode)
+	broadcast := len(subs) == 1 ||
+		lowerCode == "auth_error" ||
+		strings.Contains(lowerCode, "connection_limit") ||
+		ev.Kind == "usage_blocked" ||
+		ev.Kind == "rate_limited" ||
+		ev.Retryable
+	if !broadcast {
+		return
+	}
+	for _, sub := range subs {
+		sub.send(ev, true)
+	}
+}
 // NewUUID generates a random RFC 4122 v4 UUID string.
 func NewUUID() string {
 	var b [16]byte

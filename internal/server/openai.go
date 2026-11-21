@@ -2,7 +2,9 @@ package server
 
 import (
 	"context"
+	"crypto/sha256"
 	"crypto/subtle"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -548,7 +550,8 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 	retriedStale := false
 	var lastRotateErr string
 
-	for attempt := 0; attempt < maxRotate+1; attempt++ {
+	retriedAuth := false
+	for attempt := 0; attempt < maxRotate+2; attempt++ {
 		turnCtx, cancel := context.WithTimeout(r.Context(), s.cfg.RequestTimeout())
 		acct, eventCh, err := s.startTurnWithRetry(turnCtx, target, converted, triedAccounts)
 		if err != nil {
@@ -557,7 +560,12 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			errType := "api_error"
 			errCode := "upstream_error"
 			msg := err.Error()
-			if strings.Contains(strings.ToLower(msg), "cooldown") {
+			var overflowErr *quick.ContextOverflowError
+			if errors.As(err, &overflowErr) {
+				status = http.StatusBadRequest
+				errType = "invalid_request_error"
+				errCode = "context_length_exceeded"
+			} else if strings.Contains(strings.ToLower(msg), "cooldown") {
 				status = http.StatusTooManyRequests
 				errType = "rate_limit_error"
 				errCode = "rate_limit_exceeded"
@@ -571,25 +579,45 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		}
 
 		canRetryStale := !retriedStale
+		canRetryAuth := !retriedAuth
 		canRotate := len(triedAccounts)+1 < maxRotate
 		var retryAction retryDirective
 		if req.Stream {
-			retryAction = s.serveSSE(w, cancel, acct, chatID, created, modelEcho, converted, stops, includeUsage, eventCh, canRetryStale, canRotate)
+			retryAction = s.serveSSE(w, cancel, acct, chatID, created, modelEcho, converted, stops, includeUsage, eventCh, canRetryStale, canRetryAuth, canRotate)
 		} else {
-			retryAction = s.serveNonStreaming(w, cancel, acct, chatID, created, modelEcho, converted, stops, eventCh, canRetryStale, canRotate)
+			retryAction = s.serveNonStreaming(w, cancel, acct, chatID, created, modelEcho, converted, stops, eventCh, canRetryStale, canRetryAuth, canRotate)
 		}
 		cancel()
 
 		switch retryAction.kind {
 		case "stale_conn":
 			retriedStale = true
+			if retryAction.invalidateConn {
+				s.manager.InvalidateConn(acct.ID)
+			}
+			log.Printf("[chat] transient upstream error before first output account=%s code=%s; retrying once", acct.ID, retryAction.status)
+			if retryAction.backoff > 0 {
+				select {
+				case <-r.Context().Done():
+					return
+				case <-time.After(retryAction.backoff):
+				}
+			}
+			continue
+		case "auth_refresh":
+			retriedAuth = true
 			s.manager.InvalidateConn(acct.ID)
-			log.Printf("[chat] stale WS closed before first output account=%s; retrying once", acct.ID)
+			log.Printf("[chat] mid-WS auth_error before first output account=%s; forcing token refresh and retrying once", acct.ID)
+			if _, rerr := s.store.EnsureFresh(r.Context(), acct.ID, true); rerr != nil {
+				s.store.MarkCooldown(acct.ID, 2*time.Minute, rerr.Error())
+				triedAccounts[acct.ID] = true
+				lastRotateErr = rerr.Error()
+			}
 			continue
 		case "rotate_account":
 			triedAccounts[acct.ID] = true
 			lastRotateErr = retryAction.errMsg
-			log.Printf("[chat] rotating away from rate-limited account=%s", acct.ID)
+			log.Printf("[chat] rotating away from account=%s reason=%s", acct.ID, retryAction.status)
 			continue
 		default:
 			s.recordChatMetrics(chatID, modelEcho, acct.ID, req.Stream, reqStart, retryAction.status, retryAction.httpStatus, retryAction.usage, retryAction.toolCalls)
@@ -599,12 +627,14 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 }
 
 type retryDirective struct {
-	kind       string // "", "stale_conn", "rotate_account"
-	errMsg     string
-	status     string // "ok" or error code
-	httpStatus int
-	usage      *quick.TurnUsage
-	toolCalls  int
+	kind           string // "", "stale_conn", "auth_refresh", "rotate_account"
+	errMsg         string
+	status         string // "ok" or error code
+	httpStatus     int
+	invalidateConn bool
+	backoff        time.Duration
+	usage          *quick.TurnUsage
+	toolCalls      int
 }
 
 func (s *Server) recordChatMetrics(id, modelName, acctID string, stream bool, start time.Time, status string, httpStatus int, u *quick.TurnUsage, toolCalls int) {
@@ -635,7 +665,8 @@ func (s *Server) startTurnWithRetry(ctx context.Context, target models.ResolvedT
 		return auth.Account{}, nil, err
 	}
 	for attempt := 0; attempt < 2; attempt++ {
-		attachments, attErr := s.uploadImages(ctx, acct, converted.Images)
+		threadID := quick.NewUUID()
+		attachments, attErr := s.uploadImages(ctx, acct, threadID, converted.Images)
 		if attErr != nil {
 			var ae *quick.AuthError
 			if errors.As(attErr, &ae) && attempt == 0 {
@@ -645,17 +676,20 @@ func (s *Server) startTurnWithRetry(ctx context.Context, target models.ResolvedT
 					continue
 				}
 			}
-			// Non-auth image upload failure: log and proceed with text rather than hard-failing.
+			// Non-auth image upload failure: log and proceed with whatever succeeded.
 			log.Printf("[chat] image upload warning account=%s: %v", acct.ID, attErr)
 		}
 
 		ch, serr := s.manager.StreamTurn(ctx, acct, quick.TurnRequest{
-			Text:           converted.Text,
-			CustomPrompt:   converted.CustomPrompt,
-			AgentMode:      target.AgentMode,
-			ThinkingEffort: target.ThinkingEffort,
-			Attachments:    attachments,
-			SurfaceType:    s.cfg.DefaultSurface,
+			ThreadID:            threadID,
+			Text:                converted.Text,
+			CustomPrompt:        converted.CustomPrompt,
+			CompactCustomPrompt: converted.CompactCustomPrompt,
+			StageableCustomBody: converted.StageableCustomBody,
+			AgentMode:           target.AgentMode,
+			ThinkingEffort:      target.ThinkingEffort,
+			Attachments:         attachments,
+			SurfaceType:         s.cfg.DefaultSurface,
 		})
 		if serr == nil {
 			return acct, ch, nil
@@ -678,11 +712,13 @@ func (s *Server) startTurnWithRetry(ctx context.Context, target models.ResolvedT
 	return auth.Account{}, nil, errors.New("failed to start Quick turn after retry")
 }
 
-func (s *Server) uploadImages(ctx context.Context, acct auth.Account, imgs []prompt.PendingImage) ([]quick.Attachment, error) {
+func (s *Server) uploadImages(ctx context.Context, acct auth.Account, threadID string, imgs []prompt.PendingImage) ([]quick.Attachment, error) {
 	if len(imgs) == 0 {
 		return nil, nil
 	}
 	out := make([]quick.Attachment, 0, len(imgs))
+	seenSHA := make(map[string]bool, len(imgs))
+	var lastWarn error
 	for _, img := range imgs {
 		data := img.Data
 		mimeType := img.MimeType
@@ -693,6 +729,7 @@ func (s *Server) uploadImages(ctx context.Context, acct auth.Account, imgs []pro
 			}
 			resp, err := s.imgHTTP.Do(req)
 			if err != nil {
+				lastWarn = err
 				continue
 			}
 			b, rerr := io.ReadAll(io.LimitReader(resp.Body, 10<<20))
@@ -711,15 +748,25 @@ func (s *Server) uploadImages(ctx context.Context, acct auth.Account, imgs []pro
 		if len(data) == 0 {
 			continue
 		}
-		att, err := s.manager.UploadAttachment(ctx, acct, img.Name, mimeType, data)
+		sum := sha256.Sum256(data)
+		shaHex := hex.EncodeToString(sum[:])
+		if seenSHA[shaHex] {
+			continue
+		}
+		seenSHA[shaHex] = true
+		att, err := s.manager.UploadAndDeliverAttachment(ctx, acct, threadID, img.Name, mimeType, data)
 		if err != nil {
-			return out, err
+			var ae *quick.AuthError
+			if errors.As(err, &ae) {
+				return out, err
+			}
+			lastWarn = err
+			continue
 		}
 		out = append(out, att)
 	}
-	return out, nil
+	return out, lastWarn
 }
-
 // ---------------------------------------------------------------------------
 // OpenAI Streaming (SSE) & Non-Streaming response builders
 // ---------------------------------------------------------------------------
@@ -774,6 +821,7 @@ func (s *Server) serveSSE(
 	includeUsage bool,
 	eventCh <-chan quick.StreamEvent,
 	canRetryStale bool,
+	canRetryAuth bool,
 	canRotate bool,
 ) retryDirective {
 	flusher, canFlush := w.(http.Flusher)
@@ -966,12 +1014,34 @@ func (s *Server) serveSSE(
 				writeSSEErrorAndDone("rate_limit_exceeded", "rate_limit_error", ev.ErrorMsg)
 				return retryDirective{status: "rate_limit_exceeded", httpStatus: http.StatusTooManyRequests, usage: lastUsage, toolCalls: toolCallCount}
 			case "error":
-				if ev.ErrorCode == "stream_closed" && !headersSent && canRetryStale {
-					return retryDirective{kind: "stale_conn", errMsg: ev.ErrorMsg}
-				}
 				code := ev.ErrorCode
 				if code == "" {
 					code = "upstream_error"
+				}
+				if !headersSent {
+					if code == "auth_error" && canRetryAuth {
+						return retryDirective{kind: "auth_refresh", status: code, errMsg: ev.ErrorMsg}
+					}
+					if code == "stream_closed" && canRetryStale {
+						return retryDirective{kind: "stale_conn", status: code, errMsg: ev.ErrorMsg, invalidateConn: true}
+					}
+					if ev.Retryable {
+						if canRotate && strings.EqualFold(code, "service_overloaded") {
+							return retryDirective{kind: "rotate_account", status: code, errMsg: ev.ErrorMsg}
+						}
+						if canRetryStale {
+							inv := code == "delivery_failure" || strings.EqualFold(code, "InternalFailure") || strings.EqualFold(code, "session_stale")
+							var bo time.Duration
+							if !inv {
+								bo = 400 * time.Millisecond
+							}
+							return retryDirective{kind: "stale_conn", status: code, errMsg: ev.ErrorMsg, invalidateConn: inv, backoff: bo}
+						}
+					}
+					if code == "context_overflow" {
+						writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded", "invalid_request_error", ev.ErrorMsg)
+						return retryDirective{status: "context_length_exceeded", httpStatus: http.StatusBadRequest, usage: lastUsage, toolCalls: toolCallCount}
+					}
 				}
 				status := http.StatusBadGateway
 				if code == "stream_idle_timeout" {
@@ -1041,6 +1111,7 @@ func (s *Server) serveNonStreaming(
 	stops []string,
 	eventCh <-chan quick.StreamEvent,
 	canRetryStale bool,
+	canRetryAuth bool,
 	canRotate bool,
 ) retryDirective {
 	parser := prompt.NewToolStreamParser(converted.ToolMode, converted.AllowedTools)
@@ -1102,12 +1173,35 @@ func (s *Server) serveNonStreaming(
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", ev.ErrorMsg)
 			return retryDirective{status: "rate_limit_exceeded", httpStatus: http.StatusTooManyRequests, usage: lastUsage, toolCalls: len(toolCalls)}
 		case "error":
-			if ev.ErrorCode == "stream_closed" && canRetryStale && contentBuf.Len() == 0 && reasoningBuf.Len() == 0 && len(toolCalls) == 0 {
-				return retryDirective{kind: "stale_conn", errMsg: ev.ErrorMsg}
-			}
 			code := ev.ErrorCode
 			if code == "" {
 				code = "upstream_error"
+			}
+			noOutput := contentBuf.Len() == 0 && reasoningBuf.Len() == 0 && len(toolCalls) == 0
+			if noOutput {
+				if code == "auth_error" && canRetryAuth {
+					return retryDirective{kind: "auth_refresh", status: code, errMsg: ev.ErrorMsg}
+				}
+				if code == "stream_closed" && canRetryStale {
+					return retryDirective{kind: "stale_conn", status: code, errMsg: ev.ErrorMsg, invalidateConn: true}
+				}
+				if ev.Retryable {
+					if canRotate && strings.EqualFold(code, "service_overloaded") {
+						return retryDirective{kind: "rotate_account", status: code, errMsg: ev.ErrorMsg}
+					}
+					if canRetryStale {
+						inv := code == "delivery_failure" || strings.EqualFold(code, "InternalFailure") || strings.EqualFold(code, "session_stale")
+						var bo time.Duration
+						if !inv {
+							bo = 400 * time.Millisecond
+						}
+						return retryDirective{kind: "stale_conn", status: code, errMsg: ev.ErrorMsg, invalidateConn: inv, backoff: bo}
+					}
+				}
+				if code == "context_overflow" {
+					writeOpenAIError(w, http.StatusBadRequest, "context_length_exceeded", "invalid_request_error", ev.ErrorMsg)
+					return retryDirective{status: "context_length_exceeded", httpStatus: http.StatusBadRequest, usage: lastUsage, toolCalls: len(toolCalls)}
+				}
 			}
 			status := http.StatusBadGateway
 			if code == "stream_idle_timeout" {

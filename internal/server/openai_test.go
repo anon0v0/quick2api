@@ -126,7 +126,7 @@ func TestServeSSEFormatIncludeUsageAndMidStreamError(t *testing.T) {
 	w := httptest.NewRecorder()
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv.serveSSE(w, cancel, auth.Account{ID: "t1"}, "chatcmpl-1", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, true, evCh, false, false)
+	srv.serveSSE(w, cancel, auth.Account{ID: "t1"}, "chatcmpl-1", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, true, evCh, false, false, false)
 
 	if w.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d", w.Code)
@@ -163,7 +163,7 @@ func TestServeSSEFormatIncludeUsageAndMidStreamError(t *testing.T) {
 	close(errCh)
 
 	w2 := httptest.NewRecorder()
-	srv.serveSSE(w2, cancel, auth.Account{ID: "t1"}, "chatcmpl-2", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, errCh, false, false)
+	srv.serveSSE(w2, cancel, auth.Account{ID: "t1"}, "chatcmpl-2", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, errCh, false, false, false)
 	body2 := w2.Body.String()
 	if !strings.Contains(body2, `"code":"stream_idle_timeout"`) || !strings.Contains(body2, "data: [DONE]") {
 		t.Fatalf("expected SSE error frame + [DONE], got:\n%s", body2)
@@ -178,7 +178,7 @@ func TestServeSSEFormatIncludeUsageAndMidStreamError(t *testing.T) {
 	close(emptyCh)
 
 	w3 := httptest.NewRecorder()
-	srv.serveSSE(w3, cancel, auth.Account{ID: "t1"}, "chatcmpl-3", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, emptyCh, false, false)
+	srv.serveSSE(w3, cancel, auth.Account{ID: "t1"}, "chatcmpl-3", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, emptyCh, false, false, false)
 	if w3.Code != http.StatusBadGateway || !strings.Contains(w3.Body.String(), `"empty_stream"`) {
 		t.Fatalf("expected 502 empty_stream, got %d %s", w3.Code, w3.Body.String())
 	}
@@ -189,7 +189,7 @@ func TestServeSSEFormatIncludeUsageAndMidStreamError(t *testing.T) {
 	close(staleCh)
 
 	w4 := httptest.NewRecorder()
-	dir := srv.serveSSE(w4, cancel, auth.Account{ID: "t1"}, "chatcmpl-4", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, staleCh, true, false)
+	dir := srv.serveSSE(w4, cancel, auth.Account{ID: "t1"}, "chatcmpl-4", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, staleCh, true, false, false)
 	if dir.kind != "stale_conn" || w4.Body.Len() != 0 {
 		t.Fatalf("expected stale_conn retry with empty body, got dir=%+v body=%q", dir, w4.Body.String())
 	}
@@ -205,7 +205,7 @@ func TestServeNonStreamingEmptyAndToolOnlyFormat(t *testing.T) {
 	emptyCh <- quick.StreamEvent{Kind: "complete"}
 	close(emptyCh)
 	w := httptest.NewRecorder()
-	srv.serveNonStreaming(w, cancel, auth.Account{ID: "t1"}, "chatcmpl-ns1", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, emptyCh, false, false)
+	srv.serveNonStreaming(w, cancel, auth.Account{ID: "t1"}, "chatcmpl-ns1", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, emptyCh, false, false, false)
 	if w.Code != http.StatusBadGateway || !strings.Contains(w.Body.String(), `"empty_stream"`) {
 		t.Fatalf("expected 502 empty_stream, got %d %s", w.Code, w.Body.String())
 	}
@@ -217,7 +217,7 @@ func TestServeNonStreamingEmptyAndToolOnlyFormat(t *testing.T) {
 	close(tcCh)
 	w2 := httptest.NewRecorder()
 	conv := prompt.ConvertedPrompt{ToolMode: true, AllowedTools: map[string]bool{"read_file": true}}
-	srv.serveNonStreaming(w2, cancel, auth.Account{ID: "t1"}, "chatcmpl-ns2", 1700000000, "quick-opus-5.5", conv, nil, tcCh, false, false)
+	srv.serveNonStreaming(w2, cancel, auth.Account{ID: "t1"}, "chatcmpl-ns2", 1700000000, "quick-opus-5.5", conv, nil, tcCh, false, false, false)
 	if w2.Code != http.StatusOK {
 		t.Fatalf("expected 200, got %d %s", w2.Code, w2.Body.String())
 	}
@@ -254,7 +254,7 @@ func TestServeSSEKeepAliveAndPostHeaderEmptyStream(t *testing.T) {
 	w := httptest.NewRecorder()
 	_, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	srv.serveSSE(w, cancel, auth.Account{ID: "t1"}, "chatcmpl-ka", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, evCh, false, false)
+	srv.serveSSE(w, cancel, auth.Account{ID: "t1"}, "chatcmpl-ka", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, evCh, false, false, false)
 	body := w.Body.String()
 	if !strings.Contains(body, ": keep-alive\n\n") {
 		t.Fatalf("expected SSE keep-alive comment, got:\n%s", body)
@@ -356,7 +356,7 @@ func TestServeDifferentiatedCooldownRateLimitVsUsageBlocked(t *testing.T) {
 	rlCh <- quick.StreamEvent{Kind: "rate_limited", ErrorMsg: "slow down"}
 	close(rlCh)
 	w1 := httptest.NewRecorder()
-	srv.serveNonStreaming(w1, cancel, auth.Account{ID: "t1"}, "chatcmpl-rl", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, rlCh, false, false)
+	srv.serveNonStreaming(w1, cancel, auth.Account{ID: "t1"}, "chatcmpl-rl", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, rlCh, false, false, false)
 	if w1.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 on non-streaming rate_limited without rotation, got %d %s", w1.Code, w1.Body.String())
 	}
@@ -370,7 +370,7 @@ func TestServeDifferentiatedCooldownRateLimitVsUsageBlocked(t *testing.T) {
 	ubCh <- quick.StreamEvent{Kind: "usage_blocked", ErrorMsg: "limit reached"}
 	close(ubCh)
 	w2 := httptest.NewRecorder()
-	dir := srv.serveNonStreaming(w2, cancel, auth.Account{ID: "t1", TenantURL: usageSrv.URL, AccessToken: "at"}, "chatcmpl-ub", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, ubCh, false, true)
+	dir := srv.serveNonStreaming(w2, cancel, auth.Account{ID: "t1", TenantURL: usageSrv.URL, AccessToken: "at"}, "chatcmpl-ub", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, ubCh, false, false, true)
 	if dir.kind != "rotate_account" {
 		t.Fatalf("expected rotate_account directive, got %+v", dir)
 	}
@@ -736,5 +736,74 @@ func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
 	}
 	if wDel404 := postJSON("/admin/accounts/delete", `{"id":"imp-1"}`); wDel404.Code != http.StatusNotFound {
 		t.Fatalf("expected 404 deleting missing account, got %d", wDel404.Code)
+	}
+}
+
+func TestServeRetryableTransientAuthOverflowAndImageDedup(t *testing.T) {
+	srv := newTestServer(t)
+	srv.cfg.SSEKeepAliveSec = -1
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. Transient InternalFailure before headers triggers stale_conn + invalidateConn.
+	trCh := make(chan quick.StreamEvent, 1)
+	trCh <- quick.StreamEvent{Kind: "error", ErrorCode: "InternalFailure", ErrorMsg: "Failed to deliver message", Retryable: true}
+	close(trCh)
+	w1 := httptest.NewRecorder()
+	dir := srv.serveSSE(w1, cancel, auth.Account{ID: "t1"}, "chatcmpl-tr", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, trCh, true, true, false)
+	if dir.kind != "stale_conn" || !dir.invalidateConn || w1.Body.Len() != 0 {
+		t.Fatalf("expected stale_conn+invalidateConn for InternalFailure, got dir=%+v body=%q", dir, w1.Body.String())
+	}
+
+	// 2. Mid-WS auth_error before headers triggers auth_refresh retry.
+	authCh := make(chan quick.StreamEvent, 1)
+	authCh <- quick.StreamEvent{Kind: "error", ErrorCode: "auth_error", ErrorMsg: "ExpiredToken"}
+	close(authCh)
+	w2 := httptest.NewRecorder()
+	dir = srv.serveNonStreaming(w2, cancel, auth.Account{ID: "t1"}, "chatcmpl-auth", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, authCh, true, true, false)
+	if dir.kind != "auth_refresh" || w2.Body.Len() != 0 {
+		t.Fatalf("expected auth_refresh directive, got dir=%+v body=%q", dir, w2.Body.String())
+	}
+
+	// 3. Upstream context_overflow maps cleanly to HTTP 400 context_length_exceeded.
+	ovCh := make(chan quick.StreamEvent, 1)
+	ovCh <- quick.StreamEvent{Kind: "error", ErrorCode: "context_overflow", ErrorMsg: "context window exceeded"}
+	close(ovCh)
+	w3 := httptest.NewRecorder()
+	dir = srv.serveSSE(w3, cancel, auth.Account{ID: "t1"}, "chatcmpl-ov", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, false, ovCh, true, true, false)
+	if w3.Code != http.StatusBadRequest || !strings.Contains(w3.Body.String(), `"context_length_exceeded"`) || dir.kind != "" {
+		t.Fatalf("expected 400 context_length_exceeded, got code=%d dir=%+v body=%s", w3.Code, dir, w3.Body.String())
+	}
+
+	// 4. uploadImages deduplicates identical SHA-256 images and delivers with thread path.
+	uploadCount := 0
+	attSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/integration/quick-work/upload-attachment":
+			uploadCount++
+			_, _ = w.Write([]byte(`{"attachmentId":"att-dedup-1"}`))
+		case "/integration/quick-work/attachment-dlp-status":
+			_, _ = w.Write([]byte(`{"dlpJobStatus":"COMPLETED","policyAction":"ALLOW"}`))
+		case "/integration/quick-work/qbs-event":
+			inner, _ := json.Marshal(map[string]any{"path": "/data/s3files/sessions/tid-dedup/workspace/attached_files/img.jpg"})
+			apiResp, _ := json.Marshal(map[string]any{"type": "api_response", "status": 200, "body": string(inner)})
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"eventResponse": map[string]any{"invokeAgentResponse": string(apiResp)},
+			})
+		}
+	}))
+	defer attSrv.Close()
+
+	dupBytes := []byte("same-jpeg-payload-bytes")
+	atts, err := srv.uploadImages(context.Background(), auth.Account{ID: "t1", TenantURL: attSrv.URL, AccessToken: "at"}, "tid-dedup", []prompt.PendingImage{
+		{Name: "image-1.jpg", MimeType: "image/jpeg", Data: dupBytes},
+		{Name: "image-2.jpg", MimeType: "image/jpeg", Data: dupBytes},
+	})
+	if err != nil {
+		t.Fatalf("uploadImages failed: %v", err)
+	}
+	if uploadCount != 1 || len(atts) != 1 || atts[0].Path != "/data/s3files/sessions/tid-dedup/workspace/attached_files/img.jpg" {
+		t.Fatalf("expected 1 deduplicated delivered attachment, got uploads=%d atts=%+v", uploadCount, atts)
 	}
 }

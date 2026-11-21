@@ -1,6 +1,7 @@
 package quick
 
 import (
+	"bytes"
 	"encoding/base64"
 	"encoding/binary"
 	"encoding/json"
@@ -50,9 +51,21 @@ type aidpOutputPayload struct {
 	Payload string `json:"payload"`
 }
 
+// MarshalAIDPInner encodes an inner Quick JSON frame without HTML-escaping <, >, or &
+// (matching JavaScript JSON.stringify and avoiding 6x bloat on XML/HTML/code tags).
+func MarshalAIDPInner(inner any) ([]byte, error) {
+	var buf bytes.Buffer
+	enc := json.NewEncoder(&buf)
+	enc.SetEscapeHTML(false)
+	if err := enc.Encode(inner); err != nil {
+		return nil, err
+	}
+	return bytes.TrimSuffix(buf.Bytes(), []byte("\n")), nil
+}
+
 // EncodeAIDPFrame wraps an inner Quick JSON frame into the AIDP rawInputEvent binary payload.
 func EncodeAIDPFrame(inner any) ([]byte, error) {
-	innerBytes, err := json.Marshal(inner)
+	innerBytes, err := MarshalAIDPInner(inner)
 	if err != nil {
 		return nil, err
 	}

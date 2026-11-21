@@ -22,11 +22,13 @@ type PendingImage struct {
 
 // ConvertedPrompt is the rendered Quick payload derived from an OpenAI ChatCompletionRequest.
 type ConvertedPrompt struct {
-	CustomPrompt string
-	Text         string
-	Images       []PendingImage
-	ToolMode     bool
-	AllowedTools map[string]bool
+	CustomPrompt        string
+	CompactCustomPrompt string
+	StageableCustomBody string
+	Text                string
+	Images              []PendingImage
+	ToolMode            bool
+	AllowedTools        map[string]bool
 }
 
 type contentPart struct {
@@ -173,28 +175,47 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 	// Cache-friendly ordering: keep static directives (tool catalog + leading system) first,
 	// and put per-turn dynamic directives (tool_choice required/forced + response_format) last.
 	var cpParts []string
+	var compactParts []string
+	var stageableParts []string
 	if toolMode {
 		cpParts = append(cpParts, buildToolSystemDirective(tools))
+		compactParts = append(compactParts, buildCompactToolReminder())
+		stageableParts = append(stageableParts, buildToolCatalogOnly(tools))
 	} else {
 		cpParts = append(cpParts, "[Direct API Mode] Respond directly as the assistant defined below. Do NOT invoke any built-in AWS Quick workspace, file, code, browser, memory, search, or connector tools; reply directly with text only.")
+		compactParts = append(compactParts, "[Direct API Mode] Use the reference notes and context from earlier parts of this conversation. Do NOT invoke any built-in AWS Quick workspace, file, code, browser, memory, search, or connector tools; reply directly with text only.")
 	}
 
 	if len(leadingSystems) > 0 {
-		cpParts = append(cpParts, strings.Join(leadingSystems, "\n\n"))
+		joinedSys := strings.Join(leadingSystems, "\n\n")
+		cpParts = append(cpParts, joinedSys)
+		stageableParts = append(stageableParts, joinedSys)
 	}
 
 	if toolMode {
 		switch toolChoiceMode {
 		case "required":
-			cpParts = append(cpParts, "[Tool Choice = REQUIRED] You MUST call at least one of the declared caller tools in this turn.")
+			d := "[Tool Choice = REQUIRED] You MUST call at least one of the declared caller tools in this turn."
+			cpParts = append(cpParts, d)
+			compactParts = append(compactParts, d)
 		case "function":
-			cpParts = append(cpParts, fmt.Sprintf("[Tool Choice = FORCED] You MUST call the declared tool named %q in this turn.", forcedToolName))
+			d := fmt.Sprintf("[Tool Choice = FORCED] You MUST call the declared tool named %q in this turn.", forcedToolName)
+			cpParts = append(cpParts, d)
+			compactParts = append(compactParts, d)
 		}
 	}
 
 	if rf := parseResponseFormatDirective(req.ResponseFormat); rf != "" {
 		cpParts = append(cpParts, rf)
+		if len(rf) <= 4000 {
+			compactParts = append(compactParts, rf)
+		} else {
+			stageableParts = append(stageableParts, rf)
+			compactParts = append(compactParts, "[Output Format] Follow the JSON Schema output format from the reference notes above, returning valid JSON only with no markdown fences.")
+		}
 	}
+	compactCustomPrompt := strings.Join(compactParts, "\n\n")
+	stageableCustomBody := strings.Join(stageableParts, "\n\n")
 	imgCounter := 0
 	var allImages []PendingImage
 
@@ -206,14 +227,15 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 			txt = "Continue."
 		}
 		return ConvertedPrompt{
-			CustomPrompt: strings.Join(cpParts, "\n\n"),
-			Text:         txt,
-			Images:       allImages,
-			ToolMode:     toolMode,
-			AllowedTools: allowed,
+			CustomPrompt:        strings.Join(cpParts, "\n\n"),
+			CompactCustomPrompt: compactCustomPrompt,
+			StageableCustomBody: stageableCustomBody,
+			Text:                txt,
+			Images:              allImages,
+			ToolMode:            toolMode,
+			AllowedTools:        allowed,
 		}
 	}
-
 	// Build tool_call_id -> function name index so role:tool results without `name` stay labeled clearly.
 	toolCallIDToName := make(map[string]string)
 	for _, m := range rest {
@@ -337,11 +359,13 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 	}
 
 	return ConvertedPrompt{
-		CustomPrompt: strings.Join(cpParts, "\n\n"),
-		Text:         sb.String(),
-		Images:       allImages,
-		ToolMode:     toolMode,
-		AllowedTools: allowed,
+		CustomPrompt:        strings.Join(cpParts, "\n\n"),
+		CompactCustomPrompt: compactCustomPrompt,
+		StageableCustomBody: stageableCustomBody,
+		Text:                sb.String(),
+		Images:              allImages,
+		ToolMode:            toolMode,
+		AllowedTools:        allowed,
 	}
 }
 
@@ -549,6 +573,45 @@ func buildToolSystemDirective(tools []FunctionDef) string {
 		sb.Write(b)
 		sb.WriteByte('\n')
 	}
+	return sb.String()
+}
+
+func buildToolCatalogOnly(tools []FunctionDef) string {
+	var sb strings.Builder
+	sb.WriteString("Declared Caller Tools:\n")
+	for _, t := range tools {
+		entry := map[string]any{
+			"name": t.Name,
+		}
+		if t.Description != "" {
+			entry["description"] = t.Description
+		}
+		if len(t.Parameters) > 0 && string(t.Parameters) != "null" {
+			entry["parameters"] = t.Parameters
+		}
+		b, _ := json.Marshal(entry)
+		sb.WriteString("- ")
+		sb.Write(b)
+		sb.WriteByte('\n')
+	}
+	return sb.String()
+}
+
+func buildCompactToolReminder() string {
+	var sb strings.Builder
+	sb.WriteString("[Direct API Tool-Calling Mode]\n")
+	sb.WriteString("Use the reference notes and declared caller tools provided in earlier parts of this conversation.\n")
+	sb.WriteString("CRITICAL RULES:\n")
+	sb.WriteString("1. NEVER invoke any AWS Quick built-in tools (run_python, file_read, file_write, file_matches, web_search, kg_search, memory_*, browser_*, acp_*, etc.).\n")
+	sb.WriteString("2. Invoke ONLY caller-declared tools using exact XML-delimited JSON blocks:\n")
+	sb.WriteString(ToolCallOpenTag)
+	sb.WriteString("\n{\"name\": \"<exact_tool_name>\", \"arguments\": {<JSON object matching parameters schema>}}\n")
+	sb.WriteString(ToolCallCloseTag)
+	sb.WriteString("\n3. You may emit multiple ")
+	sb.WriteString(ToolCallOpenTag)
+	sb.WriteString(" blocks for parallel calls; stop immediately after the final ")
+	sb.WriteString(ToolCallCloseTag)
+	sb.WriteString(" and NEVER fabricate tool outputs.")
 	return sb.String()
 }
 func parseResponseFormatDirective(raw json.RawMessage) string {
