@@ -1,0 +1,14 @@
+{
+  "accounts": [
+    {
+      "id": "account-1",
+      "tenant_url": "https://your-cell.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev",
+      "region": "us-east-1",
+      "client_id": "REPLACE_WITH_SSO_OIDC_CLIENT_ID",
+      "client_secret": "REPLACE_WITH_SSO_OIDC_CLIENT_SECRET",
+      "access_token": "REPLACE_WITH_ACCESS_TOKEN",
+      "access_token_expiry": 0,
+      "refresh_token": "REPLACE_WITH_REFRESH_TOKEN"
+    }
+  ]
+}

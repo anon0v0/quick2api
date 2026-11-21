@@ -1,0 +1,20 @@
+# Runtime secrets & local configs
+config.json
+accounts.json
+*.local.json
+.env
+.env.*
+
+# Binaries & build artifacts
+/quick2api
+/quick2api.exe
+quick2api-*
+*.bak
+*.log
+*.out
+
+# OS & editor files
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

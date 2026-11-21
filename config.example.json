@@ -1,0 +1,15 @@
+{
+  "listen_addrs": ["127.0.0.1:18082"],
+  "api_keys": ["sk-replace-with-your-key"],
+  "accounts_file": "accounts.json",
+  "proxy_url": "",
+  "default_surface": "QUICK_WORK_DESKTOP_WINDOWS",
+  "delete_session": true,
+  "request_timeout_sec": 600,
+  "stream_idle_timeout_sec": 120,
+  "sse_keepalive_sec": 15,
+  "max_body_mb": 64,
+  "refresh_lead_sec": 600,
+  "max_concurrent_turns": 8,
+  "debug": false
+}
