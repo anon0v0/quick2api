@@ -18,6 +18,21 @@ chmod 600 config.json accounts.json
 ./quick2api -config config.json
 ```
 
+## Account Management
+
+```bash
+# Import logged-in Amazon Quick Desktop credentials (Windows)
+./quick2api import-desktop -accounts accounts.json
+
+# Standalone AWS sso-oidc PKCE login (add -headless for remote/SSH servers)
+./quick2api login -accounts accounts.json -tenant-url https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev
+
+# Zero-downtime hot reload after editing accounts.json
+kill -HUP <pid>
+```
+
+Each account in `accounts.json` supports an optional `"proxy_url"` (`http://`, `https://`, `socks5://`, `socks5h://`, `"direct"` to bypass the global `proxy_url`, or `""` to inherit it). Transient `rate_limited` errors use short exponential backoff (`1m`–`15m`), while `usage_blocked` queries `profile/usage` to apply session, monthly, or trial-expiry cooldowns.
+
 ## Endpoints
 
 - `GET /v1/models`
@@ -25,6 +40,10 @@ chmod 600 config.json accounts.json
 - `POST /v1/chat/completions`
 - `GET /healthz`
 - `GET /admin/status` (`?usage=1`)
+- `POST /admin/reload`
+- `POST /admin/accounts/proxy` (`{"id","proxy_url"}`)
+- `POST /admin/accounts/probe-proxy` (`{"id"}`)
+- `POST /admin/accounts/reset-cooldown` (`{"id"}` or `{}`)
 
 ## Models
 

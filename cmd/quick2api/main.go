@@ -12,15 +12,35 @@ import (
 	"sync"
 	"syscall"
 	"time"
-
 	"quick2api/internal/auth"
+	"quick2api/internal/cli"
 	"quick2api/internal/config"
 	"quick2api/internal/quick"
 	"quick2api/internal/server"
 )
 
 func main() {
+	if len(os.Args) > 1 {
+		switch os.Args[1] {
+		case "login":
+			if err := cli.RunLogin(os.Args[2:]); err != nil {
+				log.Fatalf("[quick2api] login: %v", err)
+			}
+			return
+		case "import-desktop":
+			if err := cli.RunImportDesktop(os.Args[2:]); err != nil {
+				log.Fatalf("[quick2api] import-desktop: %v", err)
+			}
+			return
+		}
+	}
+
 	configPath := flag.String("config", "", "Path to JSON config file")
+	flag.Usage = func() {
+		out := flag.CommandLine.Output()
+		_, _ = out.Write([]byte("Usage:\n  quick2api [-config path]\n  quick2api login [flags]\n  quick2api import-desktop [flags]\n\nServer flags:\n"))
+		flag.PrintDefaults()
+	}
 	flag.Parse()
 
 	cfg, err := config.Load(*configPath)
@@ -42,10 +62,10 @@ func main() {
 	defer manager.Close()
 
 	bgCtx, bgCancel := context.WithCancel(context.Background())
-	defer bgCancel()
 	store.StartBackgroundRefresher(bgCtx)
 
 	handler := server.New(cfg, store, manager)
+	watchReloadSignal(bgCtx, handler.ReloadAccounts)
 
 	httpServers := make([]*http.Server, 0, len(cfg.ListenAddrs))
 	var wg sync.WaitGroup

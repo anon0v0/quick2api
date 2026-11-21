@@ -15,36 +15,53 @@ import (
 	"quick2api/internal/auth"
 	"quick2api/internal/config"
 	"quick2api/internal/models"
+	"quick2api/internal/netproxy"
 	"quick2api/internal/prompt"
 	"quick2api/internal/quick"
 )
 
 // Server serves OpenAI-compatible HTTP endpoints backed by Amazon Quick.
 type Server struct {
-	cfg     config.Config
-	store   *auth.Store
-	manager *quick.Manager
-	sem     chan struct{}
-	mux     *http.ServeMux
-	imgHTTP *http.Client
+	cfg      config.Config
+	store    *auth.Store
+	manager  *quick.Manager
+	sem      chan struct{}
+	mux      *http.ServeMux
+	imgHTTP  *http.Client
+	probeURL string // fixed HTTPS IP echo endpoint (overridable in unit tests)
 }
 
 // New creates a configured HTTP handler.
 func New(cfg config.Config, store *auth.Store, manager *quick.Manager) *Server {
 	s := &Server{
-		cfg:     cfg,
-		store:   store,
-		manager: manager,
-		sem:     make(chan struct{}, cfg.MaxConcurrentTurn),
-		mux:     http.NewServeMux(),
-		imgHTTP: &http.Client{Timeout: 15 * time.Second},
+		cfg:      cfg,
+		store:    store,
+		manager:  manager,
+		sem:      make(chan struct{}, cfg.MaxConcurrentTurn),
+		mux:      http.NewServeMux(),
+		imgHTTP:  &http.Client{Timeout: 15 * time.Second},
+		probeURL: "https://api.ipify.org?format=json",
 	}
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/v1/models", s.withAuth(s.handleModels))
 	s.mux.HandleFunc("/v1/models/", s.withAuth(s.handleModelGet))
 	s.mux.HandleFunc("/v1/chat/completions", s.withAuth(s.handleChatCompletions))
 	s.mux.HandleFunc("/admin/status", s.withAuth(s.handleAdminStatus))
+	s.mux.HandleFunc("/admin/reload", s.withAuth(s.handleAdminReload))
+	s.mux.HandleFunc("/admin/accounts/proxy", s.withAuth(s.handleAdminAccountProxy))
+	s.mux.HandleFunc("/admin/accounts/probe-proxy", s.withAuth(s.handleAdminProbeProxy))
+	s.mux.HandleFunc("/admin/accounts/reset-cooldown", s.withAuth(s.handleAdminResetCooldown))
 	return s
+}
+
+// ReloadAccounts atomically reloads accounts.json and reconciles cached WebSocket connections.
+func (s *Server) ReloadAccounts() (auth.ReloadResult, error) {
+	res, err := s.store.Reload()
+	if err != nil {
+		return auth.ReloadResult{}, err
+	}
+	s.manager.ReconcileReload(res)
+	return res, nil
 }
 
 func (s *Server) ServeHTTP(w http.ResponseWriter, r *http.Request) {
@@ -127,6 +144,9 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 				u, err2 := s.manager.FetchUsage(uctx, acct)
 				if err2 == nil {
 					usages[st.ID] = u
+					if q := quick.ParseQuota(u); q != nil {
+						s.store.UpdateQuota(st.ID, q)
+					}
 				} else {
 					usages[st.ID] = map[string]string{"error": err2.Error()}
 				}
@@ -136,8 +156,170 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 			cancel()
 		}
 		resp["usage"] = usages
+		resp["accounts"] = s.store.Statuses()
 	}
 	writeJSON(w, http.StatusOK, resp)
+}
+
+func decodeStrictJSON(r *http.Request, maxBytes int64, dst any) error {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
+	if err != nil {
+		return errors.New("failed to read request body")
+	}
+	if int64(len(body)) > maxBytes {
+		return errors.New("request body too large")
+	}
+	dec := json.NewDecoder(strings.NewReader(string(body)))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(dst); err != nil {
+		return errors.New("invalid JSON request body")
+	}
+	var trailing any
+	if err := dec.Decode(&trailing); err != io.EOF {
+		return errors.New("unexpected trailing JSON data")
+	}
+	return nil
+}
+
+func (s *Server) handleAdminReload(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	res, err := s.ReloadAccounts()
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "reload_failed", "invalid_request_error", err.Error())
+		return
+	}
+	log.Printf("[admin] hot reloaded accounts total=%d enabled=%d added=%v removed=%v disabled=%v proxy_changed=%v",
+		res.Total, res.Enabled, res.Added, res.Removed, res.Disabled, res.ProxyChanged)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status": "ok",
+		"reload": res,
+	})
+}
+
+func (s *Server) handleAdminAccountProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	var req struct {
+		ID       string  `json:"id"`
+		ProxyURL *string `json:"proxy_url"`
+	}
+	if err := decodeStrictJSON(r, 8192, &req); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		return
+	}
+	req.ID = strings.TrimSpace(req.ID)
+	if req.ID == "" || req.ProxyURL == nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", "Both `id` and `proxy_url` fields are required (use empty string to clear or \"direct\" to bypass global proxy).")
+		return
+	}
+	changed, status, err := s.store.SetAccountProxy(req.ID, *req.ProxyURL)
+	if err != nil {
+		code := http.StatusBadRequest
+		if strings.Contains(err.Error(), "not found") {
+			code = http.StatusNotFound
+		}
+		writeOpenAIError(w, code, "proxy_update_failed", "invalid_request_error", err.Error())
+		return
+	}
+	if changed {
+		s.manager.InvalidateConn(req.ID)
+		log.Printf("[admin] updated outbound proxy account=%s proxy=%s", req.ID, netproxy.Redact(*req.ProxyURL))
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"changed": changed,
+		"account": status,
+	})
+}
+
+func (s *Server) handleAdminProbeProxy(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if err := decodeStrictJSON(r, 4096, &req); err != nil {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+		return
+	}
+	acct, ok := s.store.GetAccount(strings.TrimSpace(req.ID))
+	if !ok {
+		writeOpenAIError(w, http.StatusNotFound, "account_not_found", "invalid_request_error", "Account not found.")
+		return
+	}
+	egressIP, latencyMs, err := s.manager.ProbeProxy(r.Context(), acct, s.probeURL)
+	if err != nil {
+		writeOpenAIError(w, http.StatusBadGateway, "proxy_probe_failed", "api_error", err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":     "ok",
+		"id":         acct.ID,
+		"proxy":      netproxy.Redact(s.store.EffectiveProxyURL(acct)),
+		"egress_ip":  egressIP,
+		"latency_ms": latencyMs,
+	})
+}
+
+func (s *Server) handleAdminResetCooldown(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	var req struct {
+		ID string `json:"id"`
+	}
+	if r.ContentLength != 0 {
+		if err := decodeStrictJSON(r, 4096, &req); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+			return
+		}
+	}
+	cleared := s.store.ResetCooldown(strings.TrimSpace(req.ID))
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":  "ok",
+		"cleared": cleared,
+	})
+}
+
+func (s *Server) applyQuotaOrRateCooldown(acct auth.Account, evKind, msg string) {
+	if evKind == "rate_limited" {
+		d := s.store.MarkRateLimited(acct.ID, msg)
+		log.Printf("[chat] rate_limited account=%s cooldown=%s", acct.ID, d.Round(time.Second))
+		return
+	}
+	// usage_blocked: set immediate interim session cooldown so concurrent requests rotate away,
+	// then query profile/usage (bounded 5s) to distinguish monthly vs session vs trial expiry.
+	fallbackKind := auth.CooldownSessionQuota
+	fallbackDur := 30 * time.Minute
+	if strings.Contains(strings.ToLower(msg), "monthly") {
+		fallbackKind = auth.CooldownMonthlyQuota
+		fallbackDur = 6 * time.Hour
+	}
+	s.store.MarkCooldownWithKind(acct.ID, fallbackKind, fallbackDur, msg)
+
+	if acct.TenantURL != "" && acct.AccessToken != "" {
+		uctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		raw, err := s.manager.FetchUsage(uctx, acct)
+		cancel()
+		if err == nil {
+			if q := quick.ParseQuota(raw); q != nil {
+				if qKind, qDur := s.store.UpdateQuota(acct.ID, q); qKind != "" {
+					log.Printf("[chat] usage_blocked classified account=%s kind=%s cooldown=%s (monthly=%d/%d session=%d/%d)",
+						acct.ID, qKind, qDur.Round(time.Second), q.MonthlyUsed, q.MonthlyLimit, q.SessionUsed, q.SessionLimit)
+					return
+				}
+			}
+		}
+	}
+	log.Printf("[chat] usage_blocked account=%s kind=%s cooldown=%s", acct.ID, fallbackKind, fallbackDur)
 }
 
 func modelCatalogEntry(m models.ModelSpec, created int64) map[string]any {
@@ -630,7 +812,7 @@ func (s *Server) serveSSE(
 				finishReason = "content_filter"
 				goto finalize
 			case "usage_blocked", "rate_limited":
-				s.store.MarkCooldown(acct.ID, 5*time.Minute, ev.ErrorMsg)
+				s.applyQuotaOrRateCooldown(acct, ev.Kind, ev.ErrorMsg)
 				if !headersSent && canRotate {
 					return retryDirective{kind: "rotate_account", errMsg: ev.ErrorMsg}
 				}
@@ -701,6 +883,7 @@ finalize:
 	if canFlush {
 		flusher.Flush()
 	}
+	s.store.NoteSuccess(acct.ID)
 	return retryDirective{}
 }
 
@@ -769,7 +952,7 @@ func (s *Server) serveNonStreaming(
 			writeOpenAIError(w, http.StatusBadRequest, "content_filter", "invalid_request_error", ev.ErrorMsg)
 			return retryDirective{}
 		case "usage_blocked", "rate_limited":
-			s.store.MarkCooldown(acct.ID, 5*time.Minute, ev.ErrorMsg)
+			s.applyQuotaOrRateCooldown(acct, ev.Kind, ev.ErrorMsg)
 			if canRotate {
 				return retryDirective{kind: "rotate_account", errMsg: ev.ErrorMsg}
 			}
@@ -843,6 +1026,7 @@ done:
 		resp["usage"] = u
 	}
 	writeJSON(w, http.StatusOK, resp)
+	s.store.NoteSuccess(acct.ID)
 	return retryDirective{}
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {

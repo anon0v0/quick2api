@@ -261,3 +261,119 @@ func TestServeSSEKeepAliveAndPostHeaderEmptyStream(t *testing.T) {
 		t.Fatalf("expected post-header SSE empty_stream error + [DONE], got:\n%s", body)
 	}
 }
+
+func TestAdminReloadProxyProbeAndResetCooldown(t *testing.T) {
+	srv := newTestServer(t)
+
+	echoSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"ip":"198.51.100.9"}`))
+	}))
+	defer echoSrv.Close()
+	srv.probeURL = echoSrv.URL
+
+	authReq := func(method, path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer sk-test-secret")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		return w
+	}
+
+	// 1. Update proxy with strict JSON check & redacted status response.
+	w := authReq(http.MethodPost, "/admin/accounts/proxy", `{"id":"t1","proxy_url":"socks5h://u:secretpw@127.0.0.1:1080","unknown":1}`)
+	if w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for unknown field, got %d %s", w.Code, w.Body.String())
+	}
+	w = authReq(http.MethodPost, "/admin/accounts/proxy", `{"id":"t1","proxy_url":"socks5h://u:secretpw@127.0.0.1:1080"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 setting proxy, got %d %s", w.Code, w.Body.String())
+	}
+	if strings.Contains(w.Body.String(), "secretpw") || !strings.Contains(w.Body.String(), "socks5h://127.0.0.1:1080") {
+		t.Fatalf("expected redacted proxy in response: %s", w.Body.String())
+	}
+
+	// Reset back to direct so probe-proxy reaches local echoSrv.
+	w = authReq(http.MethodPost, "/admin/accounts/proxy", `{"id":"t1","proxy_url":"direct"}`)
+	if w.Code != http.StatusOK {
+		t.Fatalf("expected 200 clearing proxy to direct, got %d %s", w.Code, w.Body.String())
+	}
+	w = authReq(http.MethodPost, "/admin/accounts/probe-proxy", `{"id":"t1"}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"egress_ip":"198.51.100.9"`) {
+		t.Fatalf("expected 200 probe-proxy with egress_ip, got %d %s", w.Code, w.Body.String())
+	}
+
+	// 2. Hot reload: add t2 on disk, POST /admin/reload picks it up cleanly.
+	if err := os.WriteFile(srv.cfg.AccountsFile, []byte(`{"accounts":[
+		{"id":"t1","tenant_url":"https://cell.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev","access_token":"at","access_token_expiry":2000000000},
+		{"id":"t2","tenant_url":"https://cell2.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev","access_token":"at2","access_token_expiry":2000000000}
+	]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	w = authReq(http.MethodPost, "/admin/reload", "")
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"t2"`) || srv.store.AccountCount() != 2 {
+		t.Fatalf("expected reload to add t2, got %d count=%d body=%s", w.Code, srv.store.AccountCount(), w.Body.String())
+	}
+
+	// Invalid accounts.json on disk -> 400 and live pool untouched.
+	_ = os.WriteFile(srv.cfg.AccountsFile, []byte(`{invalid`), 0o600)
+	w = authReq(http.MethodPost, "/admin/reload", "")
+	if w.Code != http.StatusBadRequest || srv.store.AccountCount() != 2 {
+		t.Fatalf("expected 400 on malformed reload with live pool intact, got %d count=%d", w.Code, srv.store.AccountCount())
+	}
+
+	// 3. Reset cooldown clears active cooldown.
+	srv.store.MarkRateLimited("t1", "rate limit test")
+	w = authReq(http.MethodPost, "/admin/accounts/reset-cooldown", `{"id":"t1"}`)
+	if w.Code != http.StatusOK || !strings.Contains(w.Body.String(), `"cleared":1`) {
+		t.Fatalf("expected cleared:1, got %d %s", w.Code, w.Body.String())
+	}
+}
+
+func TestServeDifferentiatedCooldownRateLimitVsUsageBlocked(t *testing.T) {
+	// Mock Quick tenant server serving profile/usage with exhausted monthly quota.
+	usageSrv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		inner, _ := json.Marshal(map[string]any{
+			"monthly": map[string]any{"used": 600, "limit": 600, "percent": 100, "resets_at": time.Now().Add(4 * time.Hour).Unix()},
+			"session": map[string]any{"used": 5, "limit": 100, "percent": 5},
+		})
+		apiResp, _ := json.Marshal(map[string]any{"type": "api_response", "body": string(inner)})
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"eventResponse": map[string]any{"invokeAgentResponse": string(apiResp)},
+		})
+	}))
+	defer usageSrv.Close()
+
+	srv := newTestServer(t)
+	_, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 1. rate_limited with !canRotate -> HTTP 429 and short rate_limited cooldown (~1m).
+	rlCh := make(chan quick.StreamEvent, 1)
+	rlCh <- quick.StreamEvent{Kind: "rate_limited", ErrorMsg: "slow down"}
+	close(rlCh)
+	w1 := httptest.NewRecorder()
+	srv.serveNonStreaming(w1, cancel, auth.Account{ID: "t1"}, "chatcmpl-rl", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, rlCh, false, false)
+	if w1.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 on non-streaming rate_limited without rotation, got %d %s", w1.Code, w1.Body.String())
+	}
+	st := srv.store.Statuses()[0]
+	if st.CooldownKind != auth.CooldownRateLimited || st.CooldownRemainingSec > 70 {
+		t.Fatalf("expected short rate_limited cooldown, got %+v", st)
+	}
+
+	// 2. usage_blocked queries profile/usage -> classifies monthly_quota (~4h) and rotates when canRotate=true.
+	ubCh := make(chan quick.StreamEvent, 1)
+	ubCh <- quick.StreamEvent{Kind: "usage_blocked", ErrorMsg: "limit reached"}
+	close(ubCh)
+	w2 := httptest.NewRecorder()
+	dir := srv.serveNonStreaming(w2, cancel, auth.Account{ID: "t1", TenantURL: usageSrv.URL, AccessToken: "at"}, "chatcmpl-ub", 1700000000, "quick-opus-5.5", prompt.ConvertedPrompt{}, nil, ubCh, false, true)
+	if dir.kind != "rotate_account" {
+		t.Fatalf("expected rotate_account directive, got %+v", dir)
+	}
+	st = srv.store.Statuses()[0]
+	if st.CooldownKind != auth.CooldownMonthlyQuota || st.CooldownRemainingSec < 3*3600 {
+		t.Fatalf("expected monthly_quota cooldown >=3h, got %+v", st)
+	}
+}

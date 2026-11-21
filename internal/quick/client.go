@@ -11,6 +11,7 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"strings"
@@ -19,8 +20,8 @@ import (
 
 	"github.com/gorilla/websocket"
 	"quick2api/internal/auth"
+	"quick2api/internal/netproxy"
 )
-
 // AuthError indicates an HTTP 401/403 from the Quick AIDP gateway (token rejected).
 type AuthError struct {
 	Status int
@@ -85,38 +86,59 @@ type Manager struct {
 	proxyURL      string
 	debug         bool
 	idleTimeout   time.Duration
-	httpClient    *http.Client
+	baseTr        *http.Transport
+
+	clientMu    sync.Mutex
+	httpClients map[string]*http.Client // keyed by effective resolved proxy URL
 
 	mu    sync.Mutex
 	conns map[string]*accountConn
 }
+
 // NewManager creates a Quick transport manager.
 func NewManager(store *auth.Store, surfaceType string, deleteSession bool, proxyURL string, debug bool) (*Manager, error) {
 	if surfaceType == "" {
 		surfaceType = "QUICK_WORK_DESKTOP_WINDOWS"
 	}
-	tr := &http.Transport{
+	if err := netproxy.Validate(proxyURL); err != nil {
+		return nil, err
+	}
+	baseTr := &http.Transport{
 		MaxIdleConns:        32,
 		IdleConnTimeout:     90 * time.Second,
 		TLSHandshakeTimeout: 15 * time.Second,
-	}
-	if proxyURL != "" {
-		u, err := url.Parse(proxyURL)
-		if err != nil {
-			return nil, fmt.Errorf("invalid proxy_url: %w", err)
-		}
-		tr.Proxy = http.ProxyURL(u)
+		ForceAttemptHTTP2:   true,
 	}
 	return &Manager{
 		store:         store,
 		surfaceType:   surfaceType,
 		deleteSession: deleteSession,
-		proxyURL:      proxyURL,
+		proxyURL:      strings.TrimSpace(proxyURL),
 		debug:         debug,
 		idleTimeout:   120 * time.Second,
-		httpClient:    &http.Client{Transport: tr, Timeout: 35 * time.Second},
+		baseTr:        baseTr,
+		httpClients:   make(map[string]*http.Client),
 		conns:         make(map[string]*accountConn),
 	}, nil
+}
+
+func (m *Manager) effectiveProxy(acct auth.Account) string {
+	return netproxy.Resolve(acct.ProxyURL, m.proxyURL)
+}
+
+func (m *Manager) httpClientForProxy(effectiveProxy string) (*http.Client, error) {
+	m.clientMu.Lock()
+	defer m.clientMu.Unlock()
+	if c, ok := m.httpClients[effectiveProxy]; ok {
+		return c, nil
+	}
+	tr, err := netproxy.NewTransport(m.baseTr, effectiveProxy)
+	if err != nil {
+		return nil, err
+	}
+	c := &http.Client{Transport: tr, Timeout: 35 * time.Second}
+	m.httpClients[effectiveProxy] = c
+	return c, nil
 }
 
 // SetStreamIdleTimeout configures the per-turn idle watchdog duration (<=0 disables).
@@ -158,7 +180,7 @@ func (m *Manager) ActiveConnections() int {
 	return n
 }
 
-// InvalidateConn closes and removes the cached WS connection for an account (e.g. after 401/refresh).
+// InvalidateConn closes and removes the cached WS connection for an account (e.g. after 401/refresh/proxy change).
 func (m *Manager) InvalidateConn(accountID string) {
 	m.mu.Lock()
 	c, ok := m.conns[accountID]
@@ -171,10 +193,25 @@ func (m *Manager) InvalidateConn(accountID string) {
 	}
 }
 
+// ReconcileReload closes cached WebSockets only for accounts that were removed, disabled,
+// or changed outbound proxy, leaving unchanged healthy accounts' connections intact.
+func (m *Manager) ReconcileReload(res auth.ReloadResult) {
+	seen := make(map[string]bool)
+	for _, list := range [][]string{res.Removed, res.Disabled, res.ProxyChanged} {
+		for _, id := range list {
+			if id != "" && !seen[id] {
+				seen[id] = true
+				m.InvalidateConn(id)
+			}
+		}
+	}
+}
+
 // getOrDialConn returns an existing live WS connection for acct or dials a new one.
 func (m *Manager) getOrDialConn(ctx context.Context, acct auth.Account) (*accountConn, error) {
+	effProxy := m.effectiveProxy(acct)
 	m.mu.Lock()
-	if c, ok := m.conns[acct.ID]; ok && c.isAlive() && c.token == acct.AccessToken {
+	if c, ok := m.conns[acct.ID]; ok && c.isAlive() && c.token == acct.AccessToken && c.proxyURL == effProxy {
 		m.mu.Unlock()
 		return c, nil
 	}
@@ -190,7 +227,7 @@ func (m *Manager) getOrDialConn(ctx context.Context, acct auth.Account) (*accoun
 	}
 
 	m.mu.Lock()
-	if existing, ok := m.conns[acct.ID]; ok && existing.isAlive() && existing.token == acct.AccessToken {
+	if existing, ok := m.conns[acct.ID]; ok && existing.isAlive() && existing.token == acct.AccessToken && existing.proxyURL == effProxy {
 		m.mu.Unlock()
 		c.close("superseded")
 		return existing, nil
@@ -426,10 +463,14 @@ func (m *Manager) FetchUsage(ctx context.Context, acct auth.Account) (map[string
 	req.Header.Set("Content-Type", "application/json")
 	req.Header.Set("Authorization", "Bearer "+acct.AccessToken)
 	req.Header.Set("x-amzn-qs-internal-trace-id", NewUUID())
-
-	resp, err := m.httpClient.Do(req)
+	effProxy := m.effectiveProxy(acct)
+	hc, err := m.httpClientForProxy(effProxy)
 	if err != nil {
 		return nil, err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return nil, netproxy.SanitizeError(err, effProxy)
 	}
 	defer resp.Body.Close()
 	body, err := io.ReadAll(io.LimitReader(resp.Body, 2<<20))
@@ -473,6 +514,109 @@ func (m *Manager) FetchUsage(ctx context.Context, acct auth.Account) (map[string
 	return outer, nil
 }
 
+// ParseQuota converts a raw profile/usage response map into a structured auth.QuotaInfo.
+func ParseQuota(raw map[string]any) *auth.QuotaInfo {
+	if len(raw) == 0 {
+		return nil
+	}
+	q := &auth.QuotaInfo{UpdatedAt: time.Now().Unix()}
+	hasAny := false
+	if m, ok := raw["monthly"].(map[string]any); ok {
+		q.MonthlyUsed = toInt(m["used"])
+		q.MonthlyLimit = toInt(m["limit"])
+		q.MonthlyPercent = toInt(m["percent"])
+		q.MonthlyResetsAt = toInt64(m["resets_at"])
+		hasAny = true
+	}
+	if s, ok := raw["session"].(map[string]any); ok {
+		q.SessionUsed = toInt(s["used"])
+		q.SessionLimit = toInt(s["limit"])
+		q.SessionPercent = toInt(s["percent"])
+		q.SessionResetsAt = toInt64(s["resets_at"])
+		q.SessionResumeMin = toInt(s["resume_in_minutes"])
+		hasAny = true
+	}
+	if sub, ok := raw["subscription"].(map[string]any); ok {
+		if st, ok := sub["subscription_type"].(string); ok {
+			q.SubscriptionType = st
+			hasAny = true
+		}
+		if ft, ok := sub["free_trial_metadata"].(map[string]any); ok {
+			if st, ok := ft["status"].(string); ok {
+				q.TrialStatus = st
+				hasAny = true
+			}
+		}
+	}
+	if !hasAny {
+		return nil
+	}
+	return q
+}
+
+func toInt(v any) int {
+	return int(toInt64(v))
+}
+
+func toInt64(v any) int64 {
+	switch n := v.(type) {
+	case float64:
+		return int64(n)
+	case int64:
+		return n
+	case int:
+		return int64(n)
+	case json.Number:
+		if i, err := n.Int64(); err == nil {
+			return i
+		}
+	}
+	return 0
+}
+
+// ProbeProxy tests an account's resolved outbound proxy against a fixed HTTPS IP endpoint
+// without sending any provider credentials.
+func (m *Manager) ProbeProxy(ctx context.Context, acct auth.Account, targetURL string) (egressIP string, latencyMs int64, err error) {
+	if strings.TrimSpace(targetURL) == "" {
+		targetURL = "https://api.ipify.org?format=json"
+	}
+	effProxy := m.effectiveProxy(acct)
+	hc, err := m.httpClientForProxy(effProxy)
+	if err != nil {
+		return "", 0, err
+	}
+	pctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	req, err := http.NewRequestWithContext(pctx, http.MethodGet, targetURL, nil)
+	if err != nil {
+		return "", 0, err
+	}
+	start := time.Now()
+	resp, err := hc.Do(req)
+	if err != nil {
+		return "", 0, netproxy.SanitizeError(err, effProxy)
+	}
+	defer resp.Body.Close()
+	body, err := io.ReadAll(io.LimitReader(resp.Body, 4096))
+	if err != nil {
+		return "", 0, err
+	}
+	if resp.StatusCode != http.StatusOK {
+		return "", 0, fmt.Errorf("proxy probe returned HTTP %d", resp.StatusCode)
+	}
+	var parsed struct {
+		IP string `json:"ip"`
+	}
+	ipStr := strings.TrimSpace(string(body))
+	if json.Unmarshal(body, &parsed) == nil && parsed.IP != "" {
+		ipStr = strings.TrimSpace(parsed.IP)
+	}
+	if net.ParseIP(ipStr) == nil {
+		return "", 0, errors.New("proxy probe did not return a valid IP address")
+	}
+	return ipStr, time.Since(start).Milliseconds(), nil
+}
+
 // UploadAttachment uploads binary bytes (e.g. an image) to AIDP upload-attachment and returns an Attachment.
 func (m *Manager) UploadAttachment(ctx context.Context, acct auth.Account, name, mimeType string, data []byte) (Attachment, error) {
 	if name == "" {
@@ -497,10 +641,14 @@ func (m *Manager) UploadAttachment(ctx context.Context, acct auth.Account, name,
 	req.Header.Set("Content-Type", "application/octet-stream")
 	req.Header.Set("Authorization", "Bearer "+acct.AccessToken)
 	req.Header.Set("x-amzn-qs-internal-trace-id", NewUUID())
-
-	resp, err := m.httpClient.Do(req)
+	effProxy := m.effectiveProxy(acct)
+	hc, err := m.httpClientForProxy(effProxy)
 	if err != nil {
 		return Attachment{}, err
+	}
+	resp, err := hc.Do(req)
+	if err != nil {
+		return Attachment{}, netproxy.SanitizeError(err, effProxy)
 	}
 	defer resp.Body.Close()
 	raw, err := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
@@ -580,6 +728,7 @@ func (t *threadSub) close() {
 type accountConn struct {
 	accountID   string
 	token       string
+	proxyURL    string
 	surfaceType string
 	debug       bool
 	ws          *websocket.Conn
@@ -603,16 +752,14 @@ func (m *Manager) dialAccountConn(ctx context.Context, acct auth.Account) (*acco
 	q.Set("workingSessionId", NewUUID())
 	wsURL := fmt.Sprintf("wss://%s/streaming/quickwork-chat-bidirectional-stream?%s", parsed.Host, q.Encode())
 
+	effProxy := m.effectiveProxy(acct)
 	dialer := websocket.Dialer{
 		HandshakeTimeout: 25 * time.Second,
 		ReadBufferSize:   64 * 1024,
 		WriteBufferSize:  64 * 1024,
 	}
-	if m.proxyURL != "" {
-		pu, err := url.Parse(m.proxyURL)
-		if err == nil {
-			dialer.Proxy = http.ProxyURL(pu)
-		}
+	if err := netproxy.ConfigureWebSocketDialer(&dialer, effProxy); err != nil {
+		return nil, err
 	}
 
 	hdrs := http.Header{}
@@ -621,12 +768,15 @@ func (m *Manager) dialAccountConn(ctx context.Context, acct auth.Account) (*acco
 	ws, resp, err := dialer.DialContext(ctx, wsURL, hdrs)
 	if err != nil {
 		if resp != nil {
+			if resp.Body != nil {
+				_ = resp.Body.Close()
+			}
 			if resp.StatusCode == http.StatusUnauthorized || resp.StatusCode == http.StatusForbidden {
 				return nil, &AuthError{Status: resp.StatusCode, Msg: "websocket handshake rejected"}
 			}
-			return nil, fmt.Errorf("ws dial failed (http %d): %w", resp.StatusCode, err)
+			return nil, fmt.Errorf("ws dial failed (http %d): %w", resp.StatusCode, netproxy.SanitizeError(err, effProxy))
 		}
-		return nil, fmt.Errorf("ws dial failed: %w", err)
+		return nil, fmt.Errorf("ws dial failed: %w", netproxy.SanitizeError(err, effProxy))
 	}
 	ws.SetReadLimit(16 * 1024 * 1024)
 	ws.SetPongHandler(func(string) error {
@@ -637,6 +787,7 @@ func (m *Manager) dialAccountConn(ctx context.Context, acct auth.Account) (*acco
 	ac := &accountConn{
 		accountID:   acct.ID,
 		token:       acct.AccessToken,
+		proxyURL:    effProxy,
 		surfaceType: m.surfaceType,
 		debug:       m.debug,
 		ws:          ws,
@@ -773,7 +924,9 @@ func (c *accountConn) close(reason string) {
 	for _, sub := range threads {
 		sub.close()
 	}
-	_ = c.ws.Close()
+	if c.ws != nil {
+		_ = c.ws.Close()
+	}
 	if c.onClose != nil {
 		c.onClose()
 	}
