@@ -1,6 +1,7 @@
 {
   "listen_addrs": ["127.0.0.1:18082"],
   "api_keys": ["sk-replace-with-your-key"],
+  "admin_password": "",
   "accounts_file": "accounts.json",
   "proxy_url": "",
   "default_surface": "QUICK_WORK_DESKTOP_WINDOWS",

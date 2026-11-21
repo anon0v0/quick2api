@@ -19,21 +19,23 @@
         </span>
         <div>
           <h1 id="auth-title" class="auth-title">quick2api</h1>
-          <p class="auth-sub">请输入网关 API Key 以访问管理控制台</p>
+          <p class="auth-sub">请输入管理员账号密码以访问控制台</p>
         </div>
       </div>
-      <form id="auth-form" class="auth-form" autocomplete="off">
-        <label class="field-label" for="auth-key-input">API Key</label>
+      <form id="auth-form" class="auth-form" autocomplete="on">
+        <label class="field-label" for="auth-user-input">用户名</label>
+        <input id="auth-user-input" type="text" class="input mono" value="root" readonly autocomplete="username" />
+        <label class="field-label" for="auth-pass-input">密码</label>
         <div class="input-row">
-          <input id="auth-key-input" type="password" class="input" placeholder="sk-..." required autofocus />
-          <button type="button" id="auth-toggle-vis" class="btn btn-ghost btn-icon" aria-label="显示或隐藏密钥">显示</button>
+          <input id="auth-pass-input" type="password" class="input" placeholder="输入管理密码" autocomplete="current-password" required autofocus />
+          <button type="button" id="auth-toggle-vis" class="btn btn-ghost btn-icon" aria-label="显示或隐藏密码">显示</button>
         </div>
         <label class="check-row">
           <input id="auth-remember" type="checkbox" />
-          <span>记住在此浏览器（localStorage，默认仅当前会话有效）</span>
+          <span>保持登录 14 天（默认 24 小时后过期）</span>
         </label>
         <div id="auth-error" class="form-error hidden" role="alert"></div>
-        <button type="submit" id="auth-submit" class="btn btn-primary btn-block">验证并进入</button>
+        <button type="submit" id="auth-submit" class="btn btn-primary btn-block">登录控制台</button>
       </form>
     </div>
   </div>
@@ -78,7 +80,7 @@
           <button type="button" id="btn-theme" class="btn btn-ghost btn-icon" title="切换浅色/深色主题" aria-label="切换主题">
             <svg id="theme-icon" width="15" height="15" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"></svg>
           </button>
-          <button type="button" id="btn-logout" class="btn btn-ghost btn-sm hidden" title="退出并清除本地密钥">锁定</button>
+          <button type="button" id="btn-logout" class="btn btn-ghost btn-sm hidden" title="退出管理员登录">退出</button>
         </div>
       </div>
     </header>

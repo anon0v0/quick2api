@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"fmt"
 	"io"
 	"log"
 	"net"
@@ -52,7 +53,15 @@ func main() {
 	if err != nil {
 		log.Fatalf("[quick2api] load config: %v", err)
 	}
-
+	adminPass, generatedPass := cfg.EnsureAdminPassword()
+	if generatedPass {
+		// Print generated password only to stderr (never into the in-memory /admin/logs buffer).
+		_, _ = fmt.Fprintf(os.Stderr, "[quick2api] WARNING: QUICK2API_ADMIN_PASSWORD not set; generated random admin password -> username=%s password=%s\n",
+			config.AdminUsername, adminPass)
+		log.Printf("[quick2api] admin console auth enabled (username=%s, password=auto-generated; check stderr)", config.AdminUsername)
+	} else {
+		log.Printf("[quick2api] admin console auth enabled (username=%s, password=configured)", config.AdminUsername)
+	}
 	store, err := auth.NewStore(cfg.AccountsFile, cfg.RefreshLead(), cfg.ProxyURL)
 	if err != nil {
 		log.Fatalf("[quick2api] init account store: %v", err)

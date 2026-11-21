@@ -1,21 +1,27 @@
 package config
 
 import (
+	"crypto/rand"
 	"encoding/json"
 	"fmt"
+	"math/big"
 	"os"
 	"strings"
 	"time"
 )
 
+// AdminUsername is the fixed administrator login name for the embedded web console.
+const AdminUsername = "root"
+
 // Config holds runtime settings for quick2api.
 type Config struct {
-	ListenAddrs       []string `json:"listen_addrs"`
-	APIKeys           []string `json:"api_keys"`
-	AccountsFile      string   `json:"accounts_file"`
-	ProxyURL          string   `json:"proxy_url,omitempty"`
-	DefaultSurface    string   `json:"default_surface,omitempty"`
-	DeleteSession     *bool    `json:"delete_session,omitempty"`
+	ListenAddrs          []string `json:"listen_addrs"`
+	APIKeys              []string `json:"api_keys"`
+	AdminPassword        string   `json:"admin_password,omitempty"`
+	AccountsFile         string   `json:"accounts_file"`
+	ProxyURL             string   `json:"proxy_url,omitempty"`
+	DefaultSurface       string   `json:"default_surface,omitempty"`
+	DeleteSession        *bool    `json:"delete_session,omitempty"`
 	RequestTimeoutSec    int      `json:"request_timeout_sec,omitempty"`
 	StreamIdleTimeoutSec int      `json:"stream_idle_timeout_sec,omitempty"`
 	SSEKeepAliveSec      int      `json:"sse_keepalive_sec,omitempty"`
@@ -61,6 +67,9 @@ func Load(path string) (Config, error) {
 	if v := strings.TrimSpace(os.Getenv("QUICK2API_API_KEYS")); v != "" {
 		cfg.APIKeys = splitCSV(v)
 	}
+	if v := strings.TrimSpace(os.Getenv("QUICK2API_ADMIN_PASSWORD")); v != "" {
+		cfg.AdminPassword = v
+	}
 	if v := strings.TrimSpace(os.Getenv("QUICK2API_ACCOUNTS_FILE")); v != "" {
 		cfg.AccountsFile = v
 	}
@@ -70,7 +79,6 @@ func Load(path string) (Config, error) {
 	if strings.EqualFold(os.Getenv("QUICK2API_DEBUG"), "true") || os.Getenv("QUICK2API_DEBUG") == "1" {
 		cfg.Debug = true
 	}
-
 	if len(cfg.ListenAddrs) == 0 {
 		cfg.ListenAddrs = []string{"127.0.0.1:18082"}
 	}
@@ -144,4 +152,54 @@ func splitCSV(s string) []string {
 		}
 	}
 	return out
+}
+
+// EnsureAdminPassword guarantees cfg.AdminPassword is non-empty, generating a
+// cryptographically random strong password when neither env nor config supplied one.
+func (c *Config) EnsureAdminPassword() (password string, generated bool) {
+	c.AdminPassword = strings.TrimSpace(c.AdminPassword)
+	if c.AdminPassword != "" {
+		return c.AdminPassword, false
+	}
+	c.AdminPassword = GenerateStrongPassword(20)
+	return c.AdminPassword, true
+}
+
+// GenerateStrongPassword creates a random strong password containing uppercase,
+// lowercase, digits, and safe punctuation using crypto/rand.
+func GenerateStrongPassword(length int) string {
+	if length < 16 {
+		length = 16
+	}
+	const (
+		upper   = "ABCDEFGHJKLMNPQRSTUVWXYZ"
+		lower   = "abcdefghijkmnopqrstuvwxyz"
+		digits  = "23456789"
+		symbols = "!@#%+=._-"
+		all     = upper + lower + digits + symbols
+	)
+	pick := func(set string) byte {
+		n, err := rand.Int(rand.Reader, big.NewInt(int64(len(set))))
+		if err != nil {
+			panic(fmt.Errorf("crypto/rand failed: %w", err))
+		}
+		return set[n.Int64()]
+	}
+	buf := make([]byte, length)
+	buf[0] = pick(upper)
+	buf[1] = pick(lower)
+	buf[2] = pick(digits)
+	buf[3] = pick(symbols)
+	for i := 4; i < length; i++ {
+		buf[i] = pick(all)
+	}
+	for i := length - 1; i > 0; i-- {
+		jBig, err := rand.Int(rand.Reader, big.NewInt(int64(i+1)))
+		if err != nil {
+			panic(fmt.Errorf("crypto/rand failed: %w", err))
+		}
+		j := int(jBig.Int64())
+		buf[i], buf[j] = buf[j], buf[i]
+	}
+	return string(buf)
 }

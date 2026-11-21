@@ -39,7 +39,7 @@ Each account in `accounts.json` supports an optional `"proxy_url"` (`http://`, `
 - `GET /v1/models/{id}`
 - `POST /v1/chat/completions`
 - `GET /healthz`
-- `GET /admin/` (built-in minimalist web management dashboard)
+- `GET /admin/` (built-in minimalist web management dashboard, username `root` + password login)
 - `GET /admin/status` (`?usage=1`)
 - `GET /admin/metrics` & `POST /admin/metrics/reset`
 - `GET /admin/logs` (`?since=&level=&tag=&q=&limit=`) & `POST /admin/logs/clear`
@@ -65,10 +65,10 @@ Supports `reasoning_effort`, `reasoning`, `thinking`, model suffixes (e.g. `quic
 
 - `QUICK2API_LISTEN`
 - `QUICK2API_API_KEYS`
+- `QUICK2API_ADMIN_PASSWORD` (admin dashboard password for username `root`; if omitted, a strong random password is generated at startup and printed to `stderr`)
 - `QUICK2API_ACCOUNTS_FILE`
 - `QUICK2API_PROXY_URL`
 - `QUICK2API_DEBUG`
 
 ## License
-
 [MIT](LICENSE)

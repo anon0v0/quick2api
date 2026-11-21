@@ -474,3 +474,95 @@ func TestWebUIRoutesAndTelemetryEndpoints(t *testing.T) {
 		t.Fatalf("logs clear failed: %d", wc.Code)
 	}
 }
+
+func TestAdminPasswordLoginSessionCSRFAndRateLimit(t *testing.T) {
+	srv := newTestServer(t)
+	srv.cfg.AdminPassword = "TestStrongPass!99"
+	srv.adminAuth = newAdminAuthManager(config.AdminUsername, srv.cfg.AdminPassword)
+
+	// 1. Unauthenticated /admin/auth/me -> 401.
+	wMe := httptest.NewRecorder()
+	srv.ServeHTTP(wMe, httptest.NewRequest(http.MethodGet, "/admin/auth/me", nil))
+	if wMe.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 on unauthenticated /admin/auth/me, got %d", wMe.Code)
+	}
+
+	// 2. Wrong username or password -> 401.
+	badLogin := func(user, pass, xri string) *httptest.ResponseRecorder {
+		body := `{"username":"` + user + `","password":"` + pass + `"}`
+		req := httptest.NewRequest(http.MethodPost, "/admin/auth/login", strings.NewReader(body))
+		req.RemoteAddr = "127.0.0.1:54321"
+		req.Header.Set("X-Real-IP", xri)
+		req.Header.Set("X-Forwarded-Proto", "https")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		return w
+	}
+	if w := badLogin("admin", "TestStrongPass!99", "203.0.113.10"); w.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 for non-root username, got %d", w.Code)
+	}
+
+	// 3. Valid root login via loopback proxy with X-Forwarded-Proto: https -> 200 + HttpOnly/Secure/SameSite=Strict cookie.
+	wOK := badLogin("root", "TestStrongPass!99", "203.0.113.10")
+	if wOK.Code != http.StatusOK {
+		t.Fatalf("expected 200 on valid login, got %d %s", wOK.Code, wOK.Body.String())
+	}
+	cookies := wOK.Result().Cookies()
+	if len(cookies) != 1 || cookies[0].Name != adminSessionCookieName || !cookies[0].HttpOnly || !cookies[0].Secure || cookies[0].SameSite != http.SameSiteStrictMode {
+		t.Fatalf("unexpected session cookie attributes: %+v", cookies)
+	}
+	sessionCookie := cookies[0]
+
+	// 4. GET /admin/status with session cookie -> 200.
+	reqSt := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
+	reqSt.AddCookie(sessionCookie)
+	wSt := httptest.NewRecorder()
+	srv.ServeHTTP(wSt, reqSt)
+	if wSt.Code != http.StatusOK {
+		t.Fatalf("expected 200 on cookie-authed GET /admin/status, got %d", wSt.Code)
+	}
+
+	// 5. POST /admin/logs/clear with session cookie WITHOUT CSRF header -> 403; WITH CSRF header -> 200.
+	reqNoCSRF := httptest.NewRequest(http.MethodPost, "/admin/logs/clear", nil)
+	reqNoCSRF.AddCookie(sessionCookie)
+	wNoCSRF := httptest.NewRecorder()
+	srv.ServeHTTP(wNoCSRF, reqNoCSRF)
+	if wNoCSRF.Code != http.StatusForbidden {
+		t.Fatalf("expected 403 missing CSRF header, got %d", wNoCSRF.Code)
+	}
+	reqCSRF := httptest.NewRequest(http.MethodPost, "/admin/logs/clear", nil)
+	reqCSRF.AddCookie(sessionCookie)
+	reqCSRF.Header.Set(adminCSRFHeader, adminCSRFValue)
+	wCSRF := httptest.NewRecorder()
+	srv.ServeHTTP(wCSRF, reqCSRF)
+	if wCSRF.Code != http.StatusOK {
+		t.Fatalf("expected 200 with CSRF header, got %d", wCSRF.Code)
+	}
+
+	// 6. Logout revokes session so subsequent GET -> 401.
+	reqOut := httptest.NewRequest(http.MethodPost, "/admin/auth/logout", nil)
+	reqOut.AddCookie(sessionCookie)
+	reqOut.Header.Set(adminCSRFHeader, adminCSRFValue)
+	wOut := httptest.NewRecorder()
+	srv.ServeHTTP(wOut, reqOut)
+	if wOut.Code != http.StatusOK {
+		t.Fatalf("logout failed: %d", wOut.Code)
+	}
+	reqAfter := httptest.NewRequest(http.MethodGet, "/admin/status", nil)
+	reqAfter.AddCookie(sessionCookie)
+	wAfter := httptest.NewRecorder()
+	srv.ServeHTTP(wAfter, reqAfter)
+	if wAfter.Code != http.StatusUnauthorized {
+		t.Fatalf("expected 401 after logout, got %d", wAfter.Code)
+	}
+
+	// 7. Brute-force IP rate limit kicks in after maxLoginFailures -> 429.
+	for i := 0; i < maxLoginFailures; i++ {
+		if w := badLogin("root", "wrong", "203.0.113.99"); w.Code != http.StatusUnauthorized {
+			t.Fatalf("attempt %d: expected 401, got %d", i+1, w.Code)
+		}
+	}
+	if w := badLogin("root", "TestStrongPass!99", "203.0.113.99"); w.Code != http.StatusTooManyRequests {
+		t.Fatalf("expected 429 after brute-force lockout, got %d", w.Code)
+	}
+}

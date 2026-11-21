@@ -1,13 +1,11 @@
 (() => {
   "use strict";
 
-  const KEY_STORAGE = "q2a_api_key";
   const THEME_STORAGE = "q2a_theme";
 
   const state = {
-    apiKey: sessionStorage.getItem(KEY_STORAGE) || localStorage.getItem(KEY_STORAGE) || "",
-    authRequired: false,
     authenticated: false,
+    username: "root",
     activeTab: "overview",
     chartMode: "requests",
     autoRefresh: true,
@@ -140,10 +138,7 @@
 
   /* HTTP helper */
   async function apiFetch(path, options = {}) {
-    const headers = Object.assign({}, options.headers || {});
-    if (state.apiKey) {
-      headers["Authorization"] = "Bearer " + state.apiKey;
-    }
+    const headers = Object.assign({ "X-Requested-With": "quick2api-ui" }, options.headers || {});
     if (options.body !== undefined && !headers["Content-Type"]) {
       headers["Content-Type"] = "application/json";
     }
@@ -151,6 +146,7 @@
       method: options.method || "GET",
       headers,
       body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      credentials: "same-origin",
       cache: "no-store",
     });
     let data = null;
@@ -160,11 +156,12 @@
       data = null;
     }
     if (resp.status === 401) {
-      const hadKey = Boolean(state.apiKey);
-      state.authRequired = true;
+      const wasAuthed = state.authenticated;
       state.authenticated = false;
-      showAuthGate(!hadKey || options.suppressAuthError ? "" : "API Key 无效或已失效，请重新输入。");
-      throw new Error("unauthorized");
+      if (!options.noAuthGate) {
+        showAuthGate(wasAuthed && !options.suppressAuthError ? "登录会话已过期，请重新登录。" : "");
+      }
+      throw new Error((data && data.error && data.error.message) || "unauthorized");
     }
     if (!resp.ok) {
       const msg = (data && data.error && data.error.message) || `HTTP ${resp.status}`;
@@ -184,17 +181,14 @@
     } else {
       errEl.classList.add("hidden");
     }
-    $("auth-key-input").focus();
+    $("auth-pass-input").focus();
   }
 
   function hideAuthGate() {
     $("auth-gate").classList.add("hidden");
     $("auth-error").classList.add("hidden");
-    if (state.apiKey) {
-      $("btn-logout").classList.remove("hidden");
-    }
+    $("btn-logout").classList.remove("hidden");
   }
-
   /* Data Fetching */
   async function fetchCore(includeUsage = false) {
     try {
@@ -893,19 +887,20 @@
       applyTheme(next);
     });
 
-    $("btn-logout").addEventListener("click", () => {
-      state.apiKey = "";
+    $("btn-logout").addEventListener("click", async () => {
+      try {
+        await apiFetch("/admin/auth/logout", { method: "POST", noAuthGate: true });
+      } catch (_) {}
       state.authenticated = false;
-      sessionStorage.removeItem(KEY_STORAGE);
-      localStorage.removeItem(KEY_STORAGE);
-      $("auth-key-input").value = "";
+      $("auth-pass-input").value = "";
       $("btn-logout").classList.add("hidden");
       showAuthGate("");
+      toast("已退出登录");
     });
 
     // Auth gate form
     $("auth-toggle-vis").addEventListener("click", () => {
-      const inp = $("auth-key-input");
+      const inp = $("auth-pass-input");
       const show = inp.type === "password";
       inp.type = show ? "text" : "password";
       $("auth-toggle-vis").textContent = show ? "隐藏" : "显示";
@@ -913,32 +908,36 @@
 
     $("auth-form").addEventListener("submit", async (e) => {
       e.preventDefault();
-      const key = $("auth-key-input").value.trim();
-      if (!key) return;
+      const username = $("auth-user-input").value.trim() || "root";
+      const password = $("auth-pass-input").value;
+      if (!password) return;
       const btn = $("auth-submit");
       btn.disabled = true;
-      btn.textContent = "验证中...";
-      state.apiKey = key;
+      btn.textContent = "登录中...";
+      $("auth-error").classList.add("hidden");
       try {
+        await apiFetch("/admin/auth/login", {
+          method: "POST",
+          body: { username, password, remember: $("auth-remember").checked },
+          noAuthGate: true,
+        });
+        $("auth-pass-input").value = "";
         await fetchCore(false);
-        if ($("auth-remember").checked) {
-          localStorage.setItem(KEY_STORAGE, key);
-          sessionStorage.removeItem(KEY_STORAGE);
-        } else {
-          sessionStorage.setItem(KEY_STORAGE, key);
-          localStorage.removeItem(KEY_STORAGE);
-        }
         await fetchLogs(true);
         startTimers();
-        toast("已连接到 quick2api");
-      } catch (_) {
-        state.apiKey = "";
+        toast("欢迎回来，root");
+      } catch (err) {
+        const msg = /too many/i.test(err.message)
+          ? "失败次数过多，请 5 分钟后再试。"
+          : "用户名或密码错误，请重试。";
+        $("auth-error").textContent = msg;
+        $("auth-error").classList.remove("hidden");
+        $("auth-pass-input").select();
       } finally {
         btn.disabled = false;
-        btn.textContent = "验证并进入";
+        btn.textContent = "登录控制台";
       }
     });
-
     // Chart mode toggle
     document.querySelectorAll("[data-chart-mode]").forEach((b) => {
       b.addEventListener("click", () => {
