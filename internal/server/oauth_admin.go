@@ -132,21 +132,55 @@ func splitOAuthScopes(csv string) []string {
 	return out
 }
 
+func (s *Server) handleAdminOAuthDiscover(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	var req struct {
+		CallbackPort int `json:"callback_port"`
+	}
+	if r.Body != nil && r.ContentLength != 0 {
+		if err := decodeStrictJSON(r, 4096, &req); err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
+			return
+		}
+	}
+	port := req.CallbackPort
+	if port == 0 {
+		port = 18080
+	}
+	if port < 1024 || port > 65535 {
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_callback_port", "invalid_request_error", "callback_port must be between 1024 and 65535.")
+		return
+	}
+	nonce := randomOAuthHex(12)
+	discURL := cli.BuildDiscoveryURL(cli.DefaultSocialDiscoveryURL, nonce, port, cli.DefaultDesktopAppVersion)
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":            "ok",
+		"discovery_url":     discURL,
+		"nonce":             nonce,
+		"callback_port":     port,
+		"expected_callback": fmt.Sprintf("http://127.0.0.1:%d/", port),
+	})
+}
+
 func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
 		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
 		return
 	}
 	var req struct {
-		ID           string `json:"id"`
-		TenantURL    string `json:"tenant_url"`
-		ProxyURL     string `json:"proxy_url"`
-		Region       string `json:"region"`
-		IssuerURL    string `json:"issuer_url"`
-		Scopes       string `json:"scopes"`
-		CallbackPort int    `json:"callback_port"`
+		ID                   string `json:"id"`
+		TenantURL            string `json:"tenant_url"`
+		DiscoveryCallbackURL string `json:"discovery_callback_url"`
+		ProxyURL             string `json:"proxy_url"`
+		Region               string `json:"region"`
+		IssuerURL            string `json:"issuer_url"`
+		Scopes               string `json:"scopes"`
+		CallbackPort         int    `json:"callback_port"`
 	}
-	if err := decodeStrictJSON(r, 8192, &req); err != nil {
+	if err := decodeStrictJSON(r, 16384, &req); err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid_request_error", err.Error())
 		return
 	}
@@ -159,8 +193,25 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	effProxy := netproxy.Resolve(acctProxy, s.cfg.ProxyURL)
 
 	tenantURL := strings.TrimRight(strings.TrimSpace(req.TenantURL), "/")
+	region := strings.TrimSpace(req.Region)
+	issuer := strings.TrimSpace(req.IssuerURL)
+
+	if discRaw := strings.TrimSpace(req.DiscoveryCallbackURL); discRaw != "" {
+		disc, err := cli.ParseDiscoveryCallback(discRaw)
+		if err != nil {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_discovery_url", "invalid_request_error", err.Error())
+			return
+		}
+		tenantURL = disc.TenantURL
+		if disc.IssuerURL != "" && (issuer == "" || issuer == cli.DefaultSocialIssuerURL) {
+			issuer = disc.IssuerURL
+		}
+		if disc.Region != "" && (region == "" || region == "us-east-1") {
+			region = disc.Region
+		}
+	}
 	if tenantURL == "" {
-		// Auto-reuse existing tenant_url from pool if available.
+		// Fallback: reuse existing tenant_url from pool if available.
 		for _, existing := range s.store.AccountsSnapshot() {
 			if existing.TenantURL != "" {
 				tenantURL = existing.TenantURL
@@ -169,15 +220,13 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	if parsed, err := url.Parse(tenantURL); err != nil || parsed.Scheme != "https" || parsed.Host == "" {
-		writeOpenAIError(w, http.StatusBadRequest, "invalid_tenant_url", "invalid_request_error", "A valid https:// tenant_url is required (e.g. https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev).")
+		writeOpenAIError(w, http.StatusBadRequest, "invalid_tenant_url", "invalid_request_error", "A valid https:// tenant_url (or discovery_callback_url from quick.aws.com) is required.")
 		return
 	}
 
-	region := strings.TrimSpace(req.Region)
 	if region == "" {
 		region = "us-east-1"
 	}
-	issuer := strings.TrimSpace(req.IssuerURL)
 	if issuer == "" {
 		issuer = cli.DefaultSocialIssuerURL
 	}
@@ -237,7 +286,7 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		expiresAt:             now.Add(oauthSessionTTL),
 	}
 	s.oauthSessions.put(sess, now)
-	log.Printf("[admin] started web oauth flow region=%s callback_port=%d proxy=%s", region, port, netproxy.Redact(effProxy))
+	log.Printf("[admin] started web oauth flow region=%s callback_port=%d scopes=%s proxy=%s", region, port, strings.Join(scopes, ","), netproxy.Redact(effProxy))
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":         "ok",
@@ -245,6 +294,8 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 		"auth_url":       authURL,
 		"redirect_uri":   redirectURI,
 		"region":         region,
+		"issuer_url":     issuer,
+		"scopes":         scopes,
 		"tenant_url":     tenantURL,
 		"proxy":          netproxy.Redact(acctProxy),
 		"expires_in_sec": int(oauthSessionTTL.Seconds()),
@@ -418,7 +469,7 @@ func (s *Server) handleAdminOAuthCallback(w http.ResponseWriter, r *http.Request
 			break
 		}
 	}
-	log.Printf("[admin] web oauth login succeeded account=%s added=%v updated=%v usage_ok=%v", acct.ID, added, updated, usageOK)
+	log.Printf("[admin] web oauth login succeeded account=%s added=%v updated=%v usage_ok=%v usage_note=%q", acct.ID, added, updated, usageOK, usageNote)
 
 	writeJSON(w, http.StatusOK, map[string]any{
 		"status":     "ok",

@@ -967,8 +967,86 @@
     $("oauth-open-link").setAttribute("href", "#");
     $("oauth-callback-input").value = "";
     $("oauth-error").classList.add("hidden");
+    $("oauth-warn").classList.add("hidden");
     $("oauth-ok").classList.add("hidden");
-    $("oauth-start-btn").textContent = "生成登录链接";
+    $("oauth-start-btn").textContent = "步骤 2：生成 OIDC 授权链接";
+  }
+
+  function parseDiscoveryCallbackInput(raw) {
+    const s = (raw || "").trim();
+    if (!s) return { error: "请先粘贴 quick.aws.com 跳转后的回调 URL。" };
+    let parseTarget = s;
+    if (!parseTarget.includes("://") && (parseTarget.includes("=") || parseTarget.startsWith("?"))) {
+      parseTarget = "http://127.0.0.1/discovery?" + parseTarget.replace(/^\?/, "");
+    }
+    let u;
+    try {
+      u = new URL(parseTarget);
+    } catch (_) {
+      return { error: "URL 格式无效，请复制浏览器地址栏完整链接。" };
+    }
+    const params = new URLSearchParams(u.search);
+    if (u.hash && u.hash.includes("=")) {
+      const fp = new URLSearchParams(u.hash.replace(/^#\??/, ""));
+      fp.forEach((v, k) => { if (!params.get(k)) params.set(k, v); });
+    }
+    const pick = (...keys) => {
+      for (const k of keys) {
+        const v = (params.get(k) || "").trim();
+        if (v) return v;
+      }
+      return "";
+    };
+    const errCode = pick("error");
+    if (errCode) {
+      const desc = pick("error_description", "errorDescription");
+      return { error: desc ? `${errCode}: ${desc}` : errCode };
+    }
+    let tenant = pick("tenant_url", "tenantUrl", "tenant").replace(/\/+$/, "");
+    if (!tenant) {
+      const wsHost = pick("ws_host", "wsHost");
+      if (wsHost) tenant = "https://" + wsHost.replace(/^https?:\/\//i, "").replace(/\/+$/, "");
+    }
+    if (!tenant && u.protocol === "https:" && u.hostname && u.hostname !== "127.0.0.1" && u.hostname !== "localhost") {
+      tenant = "https://" + u.host;
+    }
+    if (tenant && !tenant.includes("://")) tenant = "https://" + tenant;
+    if (!tenant || !/^https:\/\/[^/\s]+/i.test(tenant)) {
+      return { error: "未在链接中检测到有效的 https:// tenant_url，请确认已复制登录后跳转的完整 127.0.0.1 地址栏链接。" };
+    }
+    let issuer = pick("issuer_url", "issuerUrl", "issuer").replace(/\/+$/, "");
+    const instId = pick("idc_instance_id", "idcInstanceId");
+    if (!issuer && instId) issuer = "https://identitycenter.amazonaws.com/" + instId;
+    let region = pick("idc_region", "idcRegion", "region");
+    if (!region) {
+      const m = tenant.match(/\.((?:us|eu|ap|ca|sa|me|af)-[a-z]+-\d+)\./i);
+      if (m) region = m[1].toLowerCase();
+    }
+    return { tenant_url: tenant, issuer_url: issuer, region };
+  }
+
+  function applyDiscoveryCallback(raw, silentOnEmpty = false) {
+    if (!raw || !raw.trim()) {
+      if (!silentOnEmpty) {
+        $("oauth-error").textContent = "请先粘贴 quick.aws.com 跳转后的回调 URL。";
+        $("oauth-error").classList.remove("hidden");
+      }
+      return false;
+    }
+    const parsed = parseDiscoveryCallbackInput(raw);
+    if (parsed.error) {
+      $("oauth-error").textContent = parsed.error;
+      $("oauth-error").classList.remove("hidden");
+      $("oauth-disc-badge").classList.add("hidden");
+      return false;
+    }
+    $("oauth-error").classList.add("hidden");
+    $("oauth-tenant-input").value = parsed.tenant_url;
+    if (parsed.issuer_url) $("oauth-issuer-input").value = parsed.issuer_url;
+    if (parsed.region) $("oauth-region-input").value = parsed.region;
+    $("oauth-disc-badge").classList.remove("hidden");
+    toast("已自动提取该账号的 tenant_url 与区域，请点击步骤 2 生成授权链接");
+    return true;
   }
 
   function openOAuthModal(mode = "oauth") {
@@ -976,22 +1054,22 @@
     $("import-error").classList.add("hidden");
     $("import-json-input").value = "";
     $("import-proxy-input").value = "";
-    // Pre-fill tenant_url from existing account pool if input is empty
-    const tenantInput = $("oauth-tenant-input");
-    if (!tenantInput.value.trim()) {
-      const firstWithHost = ((state.status && state.status.accounts) || []).find((a) => a.tenant_host);
-      if (firstWithHost) {
-        tenantInput.value = "https://" + firstWithHost.tenant_host;
-      }
-    }
+    $("oauth-disc-callback").value = "";
+    $("oauth-disc-url").value = "";
+    $("oauth-disc-url").classList.add("hidden");
+    $("oauth-disc-open").classList.add("hidden");
+    $("oauth-disc-copy").classList.add("hidden");
+    $("oauth-disc-badge").classList.add("hidden");
+    $("oauth-tenant-input").value = "";
+    $("oauth-scopes-input").value = "quicksight:read_write";
+    const firstWithHost = ((state.status && state.status.accounts) || []).find((a) => a.tenant_host);
+    $("btn-reuse-tenant").classList.toggle("hidden", !firstWithHost);
     switchAddAccountMode(mode);
     $("oauth-modal").classList.remove("hidden");
     if (mode === "import") {
       $("import-json-input").focus();
-    } else if (!tenantInput.value.trim()) {
-      tenantInput.focus();
     } else {
-      $("oauth-id-input").focus();
+      $("oauth-disc-callback").focus();
     }
   }
 
@@ -1224,16 +1302,68 @@
         $("oauth-proxy-input").focus();
       });
     });
+    $("btn-oauth-discover").addEventListener("click", async () => {
+      const btn = $("btn-oauth-discover");
+      btn.disabled = true;
+      btn.textContent = "生成中...";
+      $("oauth-error").classList.add("hidden");
+      try {
+        const port = Number($("oauth-port-input").value) || 18080;
+        const res = await apiFetch("/admin/oauth/discover", {
+          method: "POST",
+          body: { callback_port: port },
+        });
+        const url = res.discovery_url || "";
+        $("oauth-disc-url").value = url;
+        $("oauth-disc-url").classList.remove("hidden");
+        $("oauth-disc-open").setAttribute("href", url);
+        $("oauth-disc-open").classList.remove("hidden");
+        $("oauth-disc-copy").classList.remove("hidden");
+        btn.textContent = "重新生成发现链接";
+        toast("官方发现链接已生成，请点击「打开发现页」完成登录并复制回调 URL");
+      } catch (err) {
+        if (!err.unauthorized) {
+          $("oauth-error").textContent = err.message;
+          $("oauth-error").classList.remove("hidden");
+        }
+        btn.textContent = "获取官方发现链接";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    $("oauth-disc-copy").addEventListener("click", () => {
+      copyToClipboard($("oauth-disc-url").value, "发现页链接已复制");
+    });
+    $("btn-parse-disc").addEventListener("click", () => {
+      applyDiscoveryCallback($("oauth-disc-callback").value, false);
+    });
+    $("oauth-disc-callback").addEventListener("paste", () => {
+      setTimeout(() => {
+        const val = $("oauth-disc-callback").value;
+        if (val && (val.includes("tenant") || val.includes("plato.ai.aws.dev"))) {
+          applyDiscoveryCallback(val, true);
+        }
+      }, 20);
+    });
+    $("btn-reuse-tenant").addEventListener("click", () => {
+      const firstWithHost = ((state.status && state.status.accounts) || []).find((a) => a.tenant_host);
+      if (firstWithHost) {
+        $("oauth-tenant-input").value = "https://" + firstWithHost.tenant_host;
+        toast("已填入池内首个账号的租户地址（仅限同租户/重登原账号）");
+      }
+    });
     $("oauth-start-form").addEventListener("submit", async (e) => {
       e.preventDefault();
       const btn = $("oauth-start-btn");
       btn.disabled = true;
       btn.textContent = "注册 OIDC 中...";
       $("oauth-error").classList.add("hidden");
+      $("oauth-warn").classList.add("hidden");
       $("oauth-ok").classList.add("hidden");
       try {
         const payload = {
           tenant_url: $("oauth-tenant-input").value.trim(),
+          discovery_callback_url: $("oauth-disc-callback").value.trim(),
           id: $("oauth-id-input").value.trim(),
           proxy_url: $("oauth-proxy-input").value.trim(),
           region: $("oauth-region-input").value.trim(),
@@ -1246,21 +1376,24 @@
           body: payload,
         });
         state.oauthSession = res;
+        if (res.tenant_url) $("oauth-tenant-input").value = res.tenant_url;
+        if (res.region) $("oauth-region-input").value = res.region;
+        if (res.issuer_url) $("oauth-issuer-input").value = res.issuer_url;
         $("oauth-auth-url").value = res.auth_url || "";
         $("oauth-open-link").setAttribute("href", res.auth_url || "#");
         $("oauth-redir-preview").textContent = res.redirect_uri || "http://127.0.0.1:18080/oauth/callback";
         const mins = Math.max(1, Math.round((res.expires_in_sec || 600) / 60));
         $("oauth-ttl-hint").textContent = `有效期 ${mins} 分钟`;
         $("oauth-step2").classList.remove("hidden");
-        btn.textContent = "重新生成链接";
+        btn.textContent = "重新生成授权链接";
         $("oauth-callback-input").focus();
-        toast("授权链接已生成，请在浏览器完成登录后粘贴回调 URL");
+        toast("OIDC 授权链接已生成，请打开授权页后粘贴回调 URL");
       } catch (err) {
         if (!err.unauthorized) {
           $("oauth-error").textContent = err.message;
           $("oauth-error").classList.remove("hidden");
         }
-        btn.textContent = "生成登录链接";
+        btn.textContent = "步骤 2：生成 OIDC 授权链接";
       } finally {
         btn.disabled = false;
       }
@@ -1270,7 +1403,7 @@
     });
     $("oauth-reset-flow").addEventListener("click", () => {
       resetOAuthFlow();
-      $("oauth-tenant-input").focus();
+      $("oauth-start-btn").focus();
     });
     $("oauth-callback-form").addEventListener("submit", async (e) => {
       e.preventDefault();
@@ -1280,6 +1413,7 @@
       btn.disabled = true;
       btn.textContent = "换取 Token 中...";
       $("oauth-error").classList.add("hidden");
+      $("oauth-warn").classList.add("hidden");
       $("oauth-ok").classList.add("hidden");
       try {
         const res = await apiFetch("/admin/oauth/callback", {
@@ -1291,14 +1425,19 @@
           },
         });
         const acctId = (res.account && res.account.id) || (res.added && res.added[0]) || (res.updated && res.updated[0]) || "新账号";
-        const note = res.usage_ok ? "，已自动拉取初始配额" : "";
-        $("oauth-ok").textContent = `账号 ${acctId} 登录并热重载成功${note}。`;
-        $("oauth-ok").classList.remove("hidden");
-        toast(`OAuth 登录成功：${acctId}`);
         state.oauthSession = null;
         await fetchCore(false);
         await fetchLogs(false);
-        setTimeout(() => closeOAuthModal(), 900);
+        if (res.usage_ok) {
+          $("oauth-ok").textContent = `账号 ${acctId} 登录并热重载成功，已自动拉取初始配额。`;
+          $("oauth-ok").classList.remove("hidden");
+          toast(`OAuth 登录成功：${acctId}`);
+          setTimeout(() => closeOAuthModal(), 900);
+        } else {
+          $("oauth-warn").textContent = `账号 ${acctId} 已保存，但初始配额探测失败（${res.usage_note || "请检查 tenant_url 是否与该账号匹配或出口代理是否可达"}）。请确认已通过步骤 1 获取该账号专属 tenant_url。`;
+          $("oauth-warn").classList.remove("hidden");
+          toast(`账号 ${acctId} 已保存，但初始配额探测失败`, true);
+        }
       } catch (err) {
         if (!err.unauthorized) {
           $("oauth-error").textContent = err.message;

@@ -1410,6 +1410,33 @@ html, body {
   border-radius: var(--radius-sm);
 }
 
+.form-warn {
+  font-size: 12px;
+  color: var(--warn);
+  background: var(--warn-bg);
+  padding: 8px 10px;
+  border-radius: var(--radius-sm);
+  line-height: 1.45;
+}
+
+.oauth-note {
+  font-size: 12px;
+  color: var(--ink-secondary);
+  background: var(--surface-subtle);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-sm);
+  padding: 9px 12px;
+  line-height: 1.5;
+}
+
+.label-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin-bottom: 4px;
+}
+
 /* Toasts */
 .toast-root {
   position: fixed;

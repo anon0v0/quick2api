@@ -575,6 +575,8 @@ func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
 	// Mock AWS sso-oidc endpoints (/client/register and /token).
 	var gotVerifier string
 	var gotRedirect string
+	var gotClientName string
+	var gotScopes []any
 	oidcMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		switch r.URL.Path {
@@ -584,6 +586,8 @@ func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
 				w.WriteHeader(http.StatusBadRequest)
 				return
 			}
+			gotClientName, _ = body["clientName"].(string)
+			gotScopes, _ = body["scopes"].([]any)
 			_ = json.NewEncoder(w).Encode(map[string]any{
 				"clientId":              "mock-client-id",
 				"clientSecret":          "mock-client-secret",
@@ -624,6 +628,22 @@ func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
 		return w
 	}
 
+	// 0. /admin/oauth/discover returns official quick.aws.com qwSurface discovery link.
+	wDisc := postJSON("/admin/oauth/discover", `{"callback_port":19090}`)
+	if wDisc.Code != http.StatusOK {
+		t.Fatalf("oauth/discover failed: %d %s", wDisc.Code, wDisc.Body.String())
+	}
+	var discResp struct {
+		DiscoveryURL string `json:"discovery_url"`
+		CallbackPort int    `json:"callback_port"`
+	}
+	if err := json.Unmarshal(wDisc.Body.Bytes(), &discResp); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.HasPrefix(discResp.DiscoveryURL, "https://quick.aws.com/sn?qwSurface=desktop%3A") || discResp.CallbackPort != 19090 {
+		t.Fatalf("unexpected discovery response: %+v", discResp)
+	}
+
 	// 1. Validation checks on /admin/oauth/start.
 	if w := postJSON("/admin/oauth/start", `{"proxy_url":"ftp://bad:21"}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 on invalid proxy_url, got %d: %s", w.Code, w.Body.String())
@@ -631,16 +651,20 @@ func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
 	if w := postJSON("/admin/oauth/start", `{"callback_port":80}`); w.Code != http.StatusBadRequest {
 		t.Fatalf("expected 400 on invalid callback_port, got %d: %s", w.Code, w.Body.String())
 	}
+	if w := postJSON("/admin/oauth/start", `{"discovery_callback_url":"http://127.0.0.1:19090/?foo=bar"}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on discovery URL missing tenant_url, got %d: %s", w.Code, w.Body.String())
+	}
 
-	// 2. Start OAuth flow (uses fast-fail local tenant_url so best-effort usage probe finishes immediately).
-	wStart := postJSON("/admin/oauth/start", `{"id":"web-oauth-1","tenant_url":"https://127.0.0.1:1","proxy_url":"direct","callback_port":19090}`)
+	// 2. Start OAuth flow via discovery_callback_url (uses fast-fail local tenant_url so best-effort usage probe finishes immediately).
+	wStart := postJSON("/admin/oauth/start", `{"id":"web-oauth-1","discovery_callback_url":"http://127.0.0.1:19090/?tenantUrl=https%3A%2F%2F127.0.0.1%3A1&idcRegion=us-east-1","proxy_url":"direct","callback_port":19090}`)
 	if wStart.Code != http.StatusOK {
 		t.Fatalf("oauth/start failed: %d %s", wStart.Code, wStart.Body.String())
 	}
 	var startResp struct {
-		State       string `json:"state"`
-		AuthURL     string `json:"auth_url"`
-		RedirectURI string `json:"redirect_uri"`
+		State       string   `json:"state"`
+		AuthURL     string   `json:"auth_url"`
+		RedirectURI string   `json:"redirect_uri"`
+		Scopes      []string `json:"scopes"`
 	}
 	if err := json.Unmarshal(wStart.Body.Bytes(), &startResp); err != nil {
 		t.Fatal(err)
@@ -648,11 +672,13 @@ func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
 	if startResp.State == "" || startResp.RedirectURI != "http://127.0.0.1:19090/oauth/callback" {
 		t.Fatalf("unexpected startResp: %+v", startResp)
 	}
+	if gotClientName != "AmazonQuick-Desktop" || len(gotScopes) != 1 || gotScopes[0] != "quicksight:read_write" {
+		t.Fatalf("expected official clientName & quicksight:read_write scope, got name=%q scopes=%v", gotClientName, gotScopes)
+	}
 	parsedAuth, err := url.Parse(startResp.AuthURL)
-	if err != nil || parsedAuth.Query().Get("state") != startResp.State || parsedAuth.Query().Get("code_challenge") == "" {
+	if err != nil || parsedAuth.Query().Get("state") != startResp.State || parsedAuth.Query().Get("code_challenge") == "" || parsedAuth.Query().Get("scopes") != "quicksight:read_write" {
 		t.Fatalf("invalid auth_url: %q", startResp.AuthURL)
 	}
-
 	// 3. State mismatch and upstream callback error are rejected without consuming the session.
 	wMismatch := postJSON("/admin/oauth/callback", `{"state":"`+startResp.State+`","redirect_url":"http://127.0.0.1:19090/oauth/callback?code=auth-code-xyz&state=wrongstate"}`)
 	if wMismatch.Code != http.StatusBadRequest {

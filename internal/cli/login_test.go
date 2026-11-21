@@ -139,3 +139,35 @@ func TestReassembleDesktopCredentialsChunkedAndSingle(t *testing.T) {
 		t.Fatalf("chunked UTF-16LE desktop credential was not reassembled cleanly: %+v", accounts)
 	}
 }
+
+func TestBuildAndParseDiscoveryURL(t *testing.T) {
+	u := BuildDiscoveryURL("", "nonce123", 18080, "")
+	if !strings.HasPrefix(u, DefaultSocialDiscoveryURL+"?qwSurface=") || !strings.Contains(u, "desktop%3Anonce123%3A18080%3A") {
+		t.Fatalf("unexpected discovery URL: %q", u)
+	}
+
+	// CamelCase loopback redirect with idcInstanceId + tenantUrl + idcRegion.
+	d1, err := ParseDiscoveryCallback("http://127.0.0.1:18080/callback?tenantUrl=https%3A%2F%2Fc99.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev&idcInstanceId=ssoins-abc123&idcRegion=us-west-2&nonce=nonce123")
+	if err != nil {
+		t.Fatalf("ParseDiscoveryCallback failed: %v", err)
+	}
+	if d1.TenantURL != "https://c99.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev" ||
+		d1.IssuerURL != "https://identitycenter.amazonaws.com/ssoins-abc123" ||
+		d1.Region != "us-west-2" || d1.Nonce != "nonce123" {
+		t.Fatalf("unexpected parsed camelCase discovery params: %+v", d1)
+	}
+
+	// Direct https:// tenant_url paste with region inference.
+	d2, err := ParseDiscoveryCallback("https://c77.dp.appintegrations.eu-west-1.prod.plato.ai.aws.dev/")
+	if err != nil {
+		t.Fatalf("direct tenant_url parse failed: %v", err)
+	}
+	if d2.TenantURL != "https://c77.dp.appintegrations.eu-west-1.prod.plato.ai.aws.dev" || d2.Region != "eu-west-1" {
+		t.Fatalf("unexpected direct parse: %+v", d2)
+	}
+
+	// Upstream error parameter should fail cleanly.
+	if _, err := ParseDiscoveryCallback("http://127.0.0.1:18080/?error=access_denied&error_description=cancelled"); err == nil {
+		t.Fatalf("expected error on discovery error callback")
+	}
+}

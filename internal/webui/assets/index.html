@@ -369,13 +369,39 @@
         <button type="button" id="oauth-modal-close" class="btn btn-ghost btn-icon" aria-label="关闭">✕</button>
       </div>
 
-      <!-- Mode A: Remote OAuth Callback Login (CPA-style) -->
+      <!-- Mode A: Remote OAuth Callback Login (2-stage Discovery + PKCE OIDC) -->
       <div id="add-pane-oauth" class="modal-body">
+        <div class="oauth-note">
+          <strong>什么是租户地址（tenant_url）？</strong> 每个 Amazon Quick 账号都归属各自的后端单元域名（<code class="mono">https://qbs-cell...plato.ai.aws.dev</code>），<strong>没有通用地址</strong>。添加新账号请先用下方「步骤 1」登录官方页面自动获取；若已知该账号的专属地址也可直接填写。
+        </div>
+
+        <!-- Stage 1: Official quick.aws.com qwSurface Discovery -->
+        <div class="oauth-step-box">
+          <div class="oauth-step-head">
+            <span class="step-badge">步骤 1</span>
+            <span class="strong-text">自动获取该账号的租户地址（tenant_url）</span>
+            <span id="oauth-disc-badge" class="status-pill pill-ok hidden" style="margin-left:auto">已提取</span>
+          </div>
+          <p class="field-hint">点击下方按钮打开官方发现页（<code class="mono">quick.aws.com</code>）并登录要添加的账号。登录完成后浏览器会跳到无法打开的 <code class="mono">http://127.0.0.1:18080/...</code>，复制地址栏<strong>完整 URL</strong> 粘贴到下方即可自动提取 <code class="mono">tenant_url</code>。</p>
+          <div class="oauth-url-row">
+            <button type="button" id="btn-oauth-discover" class="btn btn-secondary btn-sm">获取官方发现链接</button>
+            <a id="oauth-disc-open" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm hidden">打开发现页</a>
+            <button type="button" id="oauth-disc-copy" class="btn btn-ghost btn-sm hidden">复制发现链接</button>
+          </div>
+          <input id="oauth-disc-url" type="text" class="input mono hidden" readonly />
+          <div class="input-row">
+            <input id="oauth-disc-callback" type="text" class="input mono" placeholder="粘贴 quick.aws.com 跳转后的 http://127.0.0.1:18080/... 回调 URL" />
+            <button type="button" id="btn-parse-disc" class="btn btn-secondary btn-sm">解析</button>
+          </div>
+        </div>
+
         <form id="oauth-start-form" class="auth-form" autocomplete="off">
           <div>
-            <label class="field-label" for="oauth-tenant-input">租户地址（tenant_url）</label>
-            <input id="oauth-tenant-input" type="url" class="input mono" placeholder="https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev" required />
-            <p class="field-hint" style="margin-top:4px">若账号池已有账号会自动填入当前单元地址；不同账号归属不同单元时可按需修改。</p>
+            <div class="label-row">
+              <label class="field-label" for="oauth-tenant-input">租户地址（tenant_url）</label>
+              <button type="button" id="btn-reuse-tenant" class="link-btn hidden" title="仅重登原账号或同租户账号时复用；全新账号请使用步骤 1 获取">复用池内首个地址</button>
+            </div>
+            <input id="oauth-tenant-input" type="url" class="input mono" placeholder="通过步骤 1 自动提取，或手动填入 https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev" required />
           </div>
           <div class="form-grid-2">
             <div>
@@ -405,8 +431,8 @@
                 </div>
               </div>
               <div>
-                <label class="field-label" for="oauth-scopes-input">Scopes（逗号分隔）</label>
-                <input id="oauth-scopes-input" type="text" class="input mono" value="sso:account:access" />
+                <label class="field-label" for="oauth-scopes-input">Scopes（逗号分隔，官方默认为 quicksight:read_write）</label>
+                <input id="oauth-scopes-input" type="text" class="input mono" value="quicksight:read_write" />
               </div>
               <div>
                 <label class="field-label" for="oauth-issuer-input">Issuer URL</label>
@@ -416,27 +442,28 @@
           </details>
           <div class="modal-foot" style="justify-content:space-between;align-items:center">
             <span class="field-hint">注册与换取 Token 均经上述代理出站</span>
-            <button type="submit" id="oauth-start-btn" class="btn btn-primary">生成登录链接</button>
+            <button type="submit" id="oauth-start-btn" class="btn btn-primary">步骤 2：生成 OIDC 授权链接</button>
           </div>
         </form>
 
         <div id="oauth-step2" class="oauth-step-box hidden">
           <div class="oauth-step-head">
-            <span class="step-badge">步骤 1</span>
-            <span class="strong-text">在本地浏览器打开授权链接完成登录</span>
+            <span class="step-badge">步骤 2</span>
+            <span class="strong-text">打开 OIDC 授权链接并允许访问</span>
             <span id="oauth-ttl-hint" class="meta-text mono" style="margin-left:auto">有效期 10 分钟</span>
           </div>
           <div class="oauth-url-row">
             <input id="oauth-auth-url" type="text" class="input mono" readonly />
-            <a id="oauth-open-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">打开登录页</a>
+            <a id="oauth-open-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">打开授权页</a>
             <button type="button" id="oauth-copy-url" class="btn btn-secondary btn-sm">复制</button>
           </div>
+          <p class="field-hint">若 AWS 页面提示 <code class="mono">Your session has expired</code>：请勿点浏览器后退或复用超时链接，直接点下方「重新生成」并在新标签页（或无痕窗口）一次性完成登录。</p>
 
-          <div class="oauth-step-head" style="margin-top:8px">
-            <span class="step-badge">步骤 2</span>
-            <span class="strong-text">粘贴浏览器跳转后的完整回调 URL</span>
+          <div class="oauth-step-head" style="margin-top:6px">
+            <span class="step-badge">步骤 3</span>
+            <span class="strong-text">粘贴跳转后的回调 URL 完成入库</span>
           </div>
-          <p class="field-hint">远程部署时浏览器会跳转到无法访问的 <code class="mono" id="oauth-redir-preview">http://127.0.0.1:18080/oauth/callback</code>，直接复制地址栏完整 URL（含 <code class="mono">code=</code> 与 <code class="mono">state=</code>）粘贴到下方提交即可。</p>
+          <p class="field-hint">授权后浏览器会跳转到无法访问的 <code class="mono" id="oauth-redir-preview">http://127.0.0.1:18080/oauth/callback</code>，复制地址栏完整 URL（含 <code class="mono">code=</code> 与 <code class="mono">state=</code>）粘贴到下方提交。</p>
           <form id="oauth-callback-form" class="auth-form" autocomplete="off">
             <textarea id="oauth-callback-input" class="input textarea mono" rows="3" placeholder="http://127.0.0.1:18080/oauth/callback?code=...&state=..." required></textarea>
             <div class="modal-foot">
@@ -447,6 +474,7 @@
         </div>
 
         <div id="oauth-error" class="form-error hidden" role="alert"></div>
+        <div id="oauth-warn" class="form-warn hidden" role="status"></div>
         <div id="oauth-ok" class="form-ok hidden" role="status"></div>
       </div>
 

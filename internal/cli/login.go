@@ -30,8 +30,135 @@ import (
 const (
 	// DefaultSocialIssuerURL is AWS Identity Center's public Amazon Quick social issuer.
 	DefaultSocialIssuerURL = "https://identitycenter.amazonaws.com/ssoins-72233407e73f5d00"
-	DefaultOIDCScope       = "sso:account:access"
+	// DefaultOIDCScope is the production OIDC scope required by Amazon Quick DataPlane APIs.
+	DefaultOIDCScope = "quicksight:read_write"
+	// DefaultOIDCClientName matches the official Amazon Quick desktop OIDC client registration.
+	DefaultOIDCClientName = "AmazonQuick-Desktop"
+	// DefaultSocialDiscoveryURL is Amazon Quick's official social login discovery entry point.
+	DefaultSocialDiscoveryURL = "https://quick.aws.com/sn"
+	// DefaultDesktopAppVersion is advertised in qwSurface for desktop discovery callbacks.
+	DefaultDesktopAppVersion = "1.2.4660"
 )
+
+// DiscoveryParams holds tenant & Identity Center parameters extracted from an Amazon Quick
+// social login discovery callback URL (or direct tenant_url input).
+type DiscoveryParams struct {
+	TenantURL     string `json:"tenant_url"`
+	IssuerURL     string `json:"issuer_url,omitempty"`
+	Region        string `json:"region,omitempty"`
+	IDCInstanceID string `json:"idc_instance_id,omitempty"`
+	Nonce         string `json:"nonce,omitempty"`
+}
+
+// BuildDiscoveryURL constructs the official Amazon Quick browser-login discovery URL using
+// the qwSurface wire format `desktop:<nonce>:<port>:<appVersion>`.
+func BuildDiscoveryURL(baseURL, nonce string, port int, appVersion string) string {
+	base := strings.TrimSpace(baseURL)
+	if base == "" {
+		base = DefaultSocialDiscoveryURL
+	}
+	if port <= 0 {
+		port = 18080
+	}
+	if strings.TrimSpace(appVersion) == "" {
+		appVersion = DefaultDesktopAppVersion
+	}
+	if strings.TrimSpace(nonce) == "" {
+		nonce = randomHex(12)
+	}
+	surface := fmt.Sprintf("desktop:%s:%d:%s", nonce, port, appVersion)
+	q := url.Values{}
+	q.Set("qwSurface", surface)
+	sep := "?"
+	if strings.Contains(base, "?") {
+		sep = "&"
+	}
+	return base + sep + q.Encode()
+}
+
+// ParseDiscoveryCallback extracts tenant_url, issuer_url, region, and nonce from a pasted
+// loopback discovery redirect URL (supporting snake_case & camelCase query/fragment params)
+// or a direct https://<cell>... tenant_url.
+func ParseDiscoveryCallback(rawInput string) (DiscoveryParams, error) {
+	s := strings.TrimSpace(rawInput)
+	if s == "" {
+		return DiscoveryParams{}, errors.New("empty discovery callback input")
+	}
+	parseTarget := s
+	if !strings.Contains(parseTarget, "://") && (strings.Contains(parseTarget, "=") || strings.HasPrefix(parseTarget, "?")) {
+		parseTarget = "http://127.0.0.1/discovery?" + strings.TrimPrefix(parseTarget, "?")
+	}
+	u, err := url.Parse(parseTarget)
+	if err != nil {
+		return DiscoveryParams{}, fmt.Errorf("malformed discovery URL: %w", err)
+	}
+	merged := url.Values{}
+	for k, vals := range u.Query() {
+		merged[k] = vals
+	}
+	if frag := strings.TrimPrefix(strings.TrimSpace(u.Fragment), "?"); frag != "" && strings.Contains(frag, "=") {
+		if fq, err := url.ParseQuery(frag); err == nil {
+			for k, vals := range fq {
+				if merged.Get(k) == "" {
+					merged[k] = vals
+				}
+			}
+		}
+	}
+	first := func(keys ...string) string {
+		for _, k := range keys {
+			if v := strings.TrimSpace(merged.Get(k)); v != "" {
+				return v
+			}
+		}
+		return ""
+	}
+	if errCode := first("error"); errCode != "" {
+		desc := first("error_description", "errorDescription")
+		if desc != "" {
+			return DiscoveryParams{}, fmt.Errorf("discovery error: %s (%s)", errCode, desc)
+		}
+		return DiscoveryParams{}, fmt.Errorf("discovery error: %s", errCode)
+	}
+
+	out := DiscoveryParams{
+		TenantURL:     strings.TrimRight(first("tenant_url", "tenantUrl", "tenant"), "/"),
+		IssuerURL:     strings.TrimRight(first("issuer_url", "issuerUrl", "issuer"), "/"),
+		Region:        first("idc_region", "idcRegion", "region"),
+		IDCInstanceID: first("idc_instance_id", "idcInstanceId"),
+		Nonce:         first("nonce", "state"),
+	}
+	if out.TenantURL == "" {
+		if wsHost := first("ws_host", "wsHost"); wsHost != "" {
+			out.TenantURL = "https://" + strings.TrimPrefix(strings.TrimPrefix(wsHost, "https://"), "http://")
+		}
+	}
+	if out.TenantURL == "" && u.Scheme == "https" && u.Host != "" &&
+		!strings.EqualFold(u.Hostname(), "127.0.0.1") && !strings.EqualFold(u.Hostname(), "localhost") {
+		// User pasted a direct https://<cell>.dp.appintegrations... tenant_url.
+		out.TenantURL = "https://" + u.Host
+	}
+	if out.TenantURL != "" && !strings.Contains(out.TenantURL, "://") {
+		out.TenantURL = "https://" + out.TenantURL
+	}
+	if parsedT, err := url.Parse(out.TenantURL); err != nil || parsedT.Scheme != "https" || parsedT.Host == "" {
+		return DiscoveryParams{}, errors.New("callback URL does not contain a valid https:// tenant_url (make sure you copied the full 127.0.0.1 redirect URL after signing in on quick.aws.com)")
+	}
+	if out.IssuerURL == "" && out.IDCInstanceID != "" {
+		out.IssuerURL = "https://identitycenter.amazonaws.com/" + out.IDCInstanceID
+	}
+	if out.Region == "" {
+		// Infer region from tenant host if formatted like <cell>.dp.appintegrations.<region>.prod.plato.ai.aws.dev
+		parts := strings.Split(strings.TrimPrefix(out.TenantURL, "https://"), ".")
+		for _, p := range parts {
+			if len(p) >= 9 && strings.Count(p, "-") == 2 && (strings.HasPrefix(p, "us-") || strings.HasPrefix(p, "eu-") || strings.HasPrefix(p, "ap-") || strings.HasPrefix(p, "ca-") || strings.HasPrefix(p, "sa-") || strings.HasPrefix(p, "me-") || strings.HasPrefix(p, "af-")) {
+				out.Region = p
+				break
+			}
+		}
+	}
+	return out, nil
+}
 
 // RunLogin executes the interactive or headless AWS sso-oidc PKCE login flow and upserts the account.
 func RunLogin(args []string) error {
@@ -83,12 +210,25 @@ func RunLogin(args []string) error {
 
 	tURL := strings.TrimRight(strings.TrimSpace(*tenantURL), "/")
 	if tURL == "" {
-		fmt.Print("Enter Amazon Quick tenant_url (e.g. https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev): ")
+		discURL := BuildDiscoveryURL(DefaultSocialDiscoveryURL, randomHex(12), *port, DefaultDesktopAppVersion)
+		fmt.Println("\nNo -tenant-url provided. Open this official Amazon Quick discovery URL in your browser to auto-discover your account's tenant_url:")
+		fmt.Println(discURL)
+		fmt.Print("\nPaste the redirected 127.0.0.1 discovery URL (or a direct https:// tenant_url): ")
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("read tenant_url: %w", err)
 		}
-		tURL = strings.TrimRight(strings.TrimSpace(line), "/")
+		disc, err := ParseDiscoveryCallback(line)
+		if err != nil {
+			return err
+		}
+		tURL = disc.TenantURL
+		if disc.IssuerURL != "" && issuer == DefaultSocialIssuerURL {
+			issuer = disc.IssuerURL
+		}
+		if disc.Region != "" && reg == "us-east-1" {
+			reg = disc.Region
+		}
 	}
 	if parsed, err := url.Parse(tURL); err != nil || parsed.Scheme != "https" || parsed.Host == "" {
 		return errors.New("invalid tenant_url: must be a valid https:// URL")
@@ -193,7 +333,7 @@ type OIDCTokenResult struct {
 // RegisterOIDCClient registers a public loopback PKCE client with AWS sso-oidc.
 func RegisterOIDCClient(ctx context.Context, hc *http.Client, oidcBase, issuerURL, redirectURI string, scopes []string, effProxy string) (OIDCClientRegistration, error) {
 	payload := map[string]any{
-		"clientName":   "Amazon Quick",
+		"clientName":   DefaultOIDCClientName,
 		"clientType":   "public",
 		"issuerUrl":    issuerURL,
 		"grantTypes":   []string{"authorization_code", "refresh_token"},

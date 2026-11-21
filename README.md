@@ -211,14 +211,14 @@ export QUICK2API_ADMIN_PASSWORD="请替换为高强度管理密码"
 
 ### 方式一：Web 控制台远程 OAuth 回调登录（推荐，适配远程服务器）
 
-由于 AWS `sso-oidc` 仅接受本机回环回调地址（`http://127.0.0.1:<port>/oauth/callback`），远程部署时无需开放额外端口，直接在 Web 控制台按两步完成：
+每个 Amazon Quick 账号都绑定了专属的后端单元域名（`tenant_url`，**没有通用地址**），且 AWS `sso-oidc` 仅接受本机回环回调（`http://127.0.0.1:<port>/oauth/callback`）。Web 控制台已内置与官方桌面端一致的两阶段流程，远程部署无需开放额外端口，也无需手动查找 `tenant_url`：
 
 1. 登录 Web 控制台（`/admin/`），进入 **账号池** 页面，点击右上角 **`+ OAuth 登录`**。
-2. 填写 **租户地址（`tenant_url`）**（若账号池已有账号会自动预填）、可选自定义账号 ID 及独立出口代理（OIDC 注册与换取 Token 均会经该代理出站），点击 **`生成登录链接`**。
-3. 点击 **`打开登录页`**（或复制链接）在**本地电脑浏览器**中完成 Amazon Quick 登录授权。
-4. 授权完成后，浏览器会跳转到本地无法访问的 `http://127.0.0.1:18080/oauth/callback?code=...&state=...` 页面——直接复制浏览器地址栏的**完整 URL**，粘贴回控制台「步骤 2」输入框并点击 **`提交回调并完成登录`**。
-5. 后端校验 `state` 并换取 Token 后，自动原子写入 `accounts.json`、触发热重载，并立即尝试拉取该账号的初始配额快照。
+2. **步骤 1（自动获取 `tenant_url`）**：点击 **`获取官方发现链接`** 并打开 `quick.aws.com` 登录页完成账号登录；登录后浏览器会跳到无法访问的 `http://127.0.0.1:18080/...?...`，复制地址栏**完整 URL** 粘贴回「步骤 1」输入框，控制台会自动提取该账号专属的 `tenant_url`、`issuer_url` 与区域（若已知原账号地址也可直接填写）。
+3. **步骤 2（生成 OIDC 授权链接）**：可选填写自定义账号 ID 和单账号出口代理（OIDC 注册与换取 Token 均经该代理出站，默认作用域为官方 `quicksight:read_write`），点击 **`步骤 2：生成 OIDC 授权链接`** 并在浏览器打开完成授权。
+4. **步骤 3（粘贴回调 URL 完成入库）**：复制浏览器跳转后的完整 `http://127.0.0.1:18080/oauth/callback?code=...&state=...` 地址粘贴提交，后端换取 Token 后自动原子写入 `accounts.json`、触发热重载，并立即拉取初始配额。
 
+> **排查提示**：若打开 AWS 授权页提示 `Your session has expired`，请勿点浏览器后退或复用超时链接，直接点「重新生成」并在新标签页（或无痕窗口）一次性完成登录。
 > 在同一弹窗内也可切换到 **「导入 JSON」** 标签页，直接粘贴单账号对象、数组或 `accounts.json` 内容导入，并支持导入时统一覆盖出口代理。
 
 ### 方式二：命令行 OAuth PKCE 登录（`quick2api login`）
@@ -491,7 +491,8 @@ sudo systemctl reload nginx
 | `GET /admin/metrics` / `POST /admin/metrics/reset` | 查询或重置内存中的 24h 趋势、模型与账号用量统计 |
 | `GET /admin/logs` / `POST /admin/logs/clear` | 查询（支持 `since`/`level`/`tag`/`q`/`limit`）或清空脱敏运行日志 |
 | `POST /admin/reload` | 零停机热重载 `accounts.json` |
-| `POST /admin/oauth/start` | 发起远程 OAuth PKCE 登录，返回 `auth_url`、`state` 与 `redirect_uri` |
+| `POST /admin/oauth/discover` | 生成官方 `quick.aws.com`（`qwSurface`）发现页链接，用于自动提取账号专属 `tenant_url` |
+| `POST /admin/oauth/start` | 发起远程 OAuth PKCE 登录（支持传入 `discovery_callback_url` 或 `tenant_url`，默认作用域 `quicksight:read_write`） |
 | `POST /admin/oauth/callback` | 提交浏览器跳转后的完整回调 URL（`{"state","redirect_url","tenant_url"}`）完成入库与热重载 |
 | `POST /admin/accounts/import` | 批量或单条 JSON 导入账号（`{"payload": ..., "proxy_url": "..."}`） |
 | `POST /admin/accounts/proxy` | 修改单账号出口代理（`{"id","proxy_url"}`）并立即断开旧连接 |

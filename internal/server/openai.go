@@ -80,6 +80,7 @@ func New(cfg config.Config, store *auth.Store, manager *quick.Manager) *Server {
 	s.mux.HandleFunc("/admin/logs", s.withAdminAuth(s.handleAdminLogs))
 	s.mux.HandleFunc("/admin/logs/clear", s.withAdminAuth(s.handleAdminLogsClear))
 	s.mux.HandleFunc("/admin/reload", s.withAdminAuth(s.handleAdminReload))
+	s.mux.HandleFunc("/admin/oauth/discover", s.withAdminAuth(s.handleAdminOAuthDiscover))
 	s.mux.HandleFunc("/admin/oauth/start", s.withAdminAuth(s.handleAdminOAuthStart))
 	s.mux.HandleFunc("/admin/oauth/callback", s.withAdminAuth(s.handleAdminOAuthCallback))
 	s.mux.HandleFunc("/admin/accounts/import", s.withAdminAuth(s.handleAdminAccountImport))
