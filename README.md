@@ -39,7 +39,10 @@ Each account in `accounts.json` supports an optional `"proxy_url"` (`http://`, `
 - `GET /v1/models/{id}`
 - `POST /v1/chat/completions`
 - `GET /healthz`
+- `GET /admin/` (built-in minimalist web management dashboard)
 - `GET /admin/status` (`?usage=1`)
+- `GET /admin/metrics` & `POST /admin/metrics/reset`
+- `GET /admin/logs` (`?since=&level=&tag=&q=&limit=`) & `POST /admin/logs/clear`
 - `POST /admin/reload`
 - `POST /admin/accounts/proxy` (`{"id","proxy_url"}`)
 - `POST /admin/accounts/probe-proxy` (`{"id"}`)

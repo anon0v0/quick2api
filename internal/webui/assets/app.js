@@ -1,0 +1,1114 @@
+(() => {
+  "use strict";
+
+  const KEY_STORAGE = "q2a_api_key";
+  const THEME_STORAGE = "q2a_theme";
+
+  const state = {
+    apiKey: sessionStorage.getItem(KEY_STORAGE) || localStorage.getItem(KEY_STORAGE) || "",
+    authRequired: false,
+    authenticated: false,
+    activeTab: "overview",
+    chartMode: "requests",
+    autoRefresh: true,
+    status: null,
+    metrics: null,
+    logs: [],
+    logTags: [],
+    logLatestSeq: 0,
+    logTotalBuffered: 0,
+    logPaused: false,
+    logLevel: "all",
+    logTag: "all",
+    logSearch: "",
+    probeResults: {},
+    statusFetchedAt: 0,
+    proxyModalAcctId: "",
+  };
+
+  let pollTimer = null;
+  let logTimer = null;
+  let tickTimer = null;
+
+  const $ = (id) => document.getElementById(id);
+
+  function esc(v) {
+    return String(v == null ? "" : v)
+      .replace(/&/g, "&amp;")
+      .replace(/</g, "&lt;")
+      .replace(/>/g, "&gt;")
+      .replace(/"/g, "&quot;")
+      .replace(/'/g, "&#39;");
+  }
+
+  function fmtNum(n) {
+    const x = Number(n) || 0;
+    return x.toLocaleString("en-US");
+  }
+
+  function fmtCompact(n) {
+    const x = Number(n) || 0;
+    if (x >= 1e9) return (x / 1e9).toFixed(2) + "B";
+    if (x >= 1e6) return (x / 1e6).toFixed(2) + "M";
+    if (x >= 1e3) return (x / 1e3).toFixed(1) + "K";
+    return String(x);
+  }
+
+  function fmtDuration(sec) {
+    const s = Math.max(0, Math.floor(Number(sec) || 0));
+    if (s < 60) return `${s}s`;
+    const m = Math.floor(s / 60);
+    const rs = s % 60;
+    if (m < 60) return `${m}m ${rs}s`;
+    const h = Math.floor(m / 60);
+    const rm = m % 60;
+    if (h < 24) return `${h}h ${rm}m`;
+    const d = Math.floor(h / 24);
+    const rh = h % 24;
+    return `${d}d ${rh}h`;
+  }
+
+  function fmtLatency(ms) {
+    const v = Number(ms) || 0;
+    if (v <= 0) return "--";
+    if (v >= 1000) return (v / 1000).toFixed(2) + "s";
+    return Math.round(v) + "ms";
+  }
+
+  function fmtClock(unixSec) {
+    if (!unixSec) return "--";
+    const d = new Date(unixSec * 1000);
+    return d.toLocaleTimeString("zh-CN", { hour12: false });
+  }
+
+  function fmtDateTime(unixSec) {
+    if (!unixSec) return "--";
+    const d = new Date(unixSec * 1000);
+    const mm = String(d.getMonth() + 1).padStart(2, "0");
+    const dd = String(d.getDate()).padStart(2, "0");
+    const hh = String(d.getHours()).padStart(2, "0");
+    const mi = String(d.getMinutes()).padStart(2, "0");
+    return `${mm}-${dd} ${hh}:${mi}`;
+  }
+
+  function fmtISOTime(iso) {
+    if (!iso) return "--:--:--";
+    const d = new Date(iso);
+    if (Number.isNaN(d.getTime())) return iso.slice(11, 19);
+    return d.toLocaleTimeString("zh-CN", { hour12: false });
+  }
+
+  function cooldownLabel(kind) {
+    switch (kind) {
+      case "rate_limited": return "限流退避";
+      case "session_quota": return "会话配额冷却";
+      case "monthly_quota": return "月度配额耗尽";
+      case "subscription_expired": return "试用/订阅过期";
+      case "auth_failed": return "认证失败冷却";
+      default: return kind || "冷却中";
+    }
+  }
+
+  function toast(msg, isError = false) {
+    const root = $("toast-root");
+    const el = document.createElement("div");
+    el.className = "toast" + (isError ? " toast-err" : "");
+    el.textContent = msg;
+    root.appendChild(el);
+    setTimeout(() => {
+      el.style.opacity = "0";
+      setTimeout(() => el.remove(), 200);
+    }, 3200);
+  }
+
+  /* Theme */
+  function applyTheme(theme) {
+    const isDark = theme === "dark";
+    document.documentElement.setAttribute("data-theme", isDark ? "dark" : "light");
+    const icon = $("theme-icon");
+    if (isDark) {
+      icon.innerHTML = '<circle cx="12" cy="12" r="4"></circle><path d="M12 2v2M12 20v2M4.93 4.93l1.41 1.41M17.66 17.66l1.41 1.41M2 12h2M20 12h2M6.34 17.66l-1.41 1.41M19.07 4.93l-1.41 1.41"></path>';
+    } else {
+      icon.innerHTML = '<path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>';
+    }
+  }
+
+  function initTheme() {
+    const saved = localStorage.getItem(THEME_STORAGE);
+    applyTheme(saved === "dark" ? "dark" : "light");
+  }
+
+  /* HTTP helper */
+  async function apiFetch(path, options = {}) {
+    const headers = Object.assign({}, options.headers || {});
+    if (state.apiKey) {
+      headers["Authorization"] = "Bearer " + state.apiKey;
+    }
+    if (options.body !== undefined && !headers["Content-Type"]) {
+      headers["Content-Type"] = "application/json";
+    }
+    const resp = await fetch(path, {
+      method: options.method || "GET",
+      headers,
+      body: options.body !== undefined ? JSON.stringify(options.body) : undefined,
+      cache: "no-store",
+    });
+    let data = null;
+    try {
+      data = await resp.json();
+    } catch (_) {
+      data = null;
+    }
+    if (resp.status === 401) {
+      const hadKey = Boolean(state.apiKey);
+      state.authRequired = true;
+      state.authenticated = false;
+      showAuthGate(!hadKey || options.suppressAuthError ? "" : "API Key 无效或已失效，请重新输入。");
+      throw new Error("unauthorized");
+    }
+    if (!resp.ok) {
+      const msg = (data && data.error && data.error.message) || `HTTP ${resp.status}`;
+      throw new Error(msg);
+    }
+    return data;
+  }
+
+  /* Auth Gate */
+  function showAuthGate(errText) {
+    stopTimers();
+    $("auth-gate").classList.remove("hidden");
+    const errEl = $("auth-error");
+    if (errText) {
+      errEl.textContent = errText;
+      errEl.classList.remove("hidden");
+    } else {
+      errEl.classList.add("hidden");
+    }
+    $("auth-key-input").focus();
+  }
+
+  function hideAuthGate() {
+    $("auth-gate").classList.add("hidden");
+    $("auth-error").classList.add("hidden");
+    if (state.apiKey) {
+      $("btn-logout").classList.remove("hidden");
+    }
+  }
+
+  /* Data Fetching */
+  async function fetchCore(includeUsage = false) {
+    try {
+      const statusPath = includeUsage ? "/admin/status?usage=1" : "/admin/status";
+      const [statusData, metricsData] = await Promise.all([
+        apiFetch(statusPath),
+        apiFetch("/admin/metrics"),
+      ]);
+      state.authenticated = true;
+      hideAuthGate();
+      state.status = statusData;
+      state.statusFetchedAt = Date.now();
+      state.metrics = metricsData;
+      renderAll();
+      $("last-sync-text").textContent = "同步于 " + fmtClock(Math.floor(Date.now() / 1000));
+    } catch (err) {
+      if (err.message !== "unauthorized") {
+        setHealthPill("err", "连接异常");
+        toast("获取状态失败: " + err.message, true);
+      }
+    }
+  }
+
+  async function fetchLogs(fullReset = false) {
+    if (!state.authenticated) return;
+    try {
+      const since = fullReset ? 0 : state.logLatestSeq;
+      const qs = new URLSearchParams({ limit: "500" });
+      if (since > 0) qs.set("since", String(since));
+      const data = await apiFetch("/admin/logs?" + qs.toString());
+      if (fullReset) {
+        state.logs = data.entries || [];
+      } else if (data.entries && data.entries.length > 0) {
+        state.logs = state.logs.concat(data.entries);
+        if (state.logs.length > 1000) {
+          state.logs = state.logs.slice(state.logs.length - 1000);
+        }
+      }
+      state.logLatestSeq = data.latest_seq || state.logLatestSeq;
+      state.logTotalBuffered = data.total_buffered || 0;
+      state.logTags = data.tags || [];
+      renderLogs();
+    } catch (err) {
+      if (err.message !== "unauthorized") {
+        // silent on background poll
+      }
+    }
+  }
+
+  /* Rendering helpers */
+  function setHealthPill(kind, text) {
+    const pill = $("health-pill");
+    pill.className = "status-pill pill-" + kind;
+    $("health-text").textContent = text;
+  }
+
+  function liveCooldownRemaining(acct) {
+    const base = Number(acct.cooldown_remaining_sec) || 0;
+    if (base <= 0) return 0;
+    const elapsed = Math.floor((Date.now() - state.statusFetchedAt) / 1000);
+    return Math.max(0, base - Math.max(0, elapsed));
+  }
+
+  function accountStateBadge(acct) {
+    if (acct.disabled) return { cls: "pill-muted", text: "已禁用", cd: 0 };
+    const cd = liveCooldownRemaining(acct);
+    if (cd > 0) {
+      const isSevere = acct.cooldown_kind === "monthly_quota" || acct.cooldown_kind === "subscription_expired" || acct.cooldown_kind === "auth_failed";
+      return {
+        cls: isSevere ? "pill-err" : "pill-warn",
+        text: `${cooldownLabel(acct.cooldown_kind)} · ${fmtDuration(cd)}`,
+        cd,
+      };
+    }
+    return { cls: "pill-ok", text: "就绪", cd: 0 };
+  }
+
+  function quotaFillClass(pct) {
+    if (pct >= 95) return "fill-err";
+    if (pct >= 80) return "fill-warn";
+    return "fill-ok";
+  }
+
+  function renderAll() {
+    renderHealthAndKPIs();
+    renderHourlyChart();
+    renderOverviewModels();
+    renderOverviewAccounts();
+    renderOverviewRecent();
+    renderAccountsTab();
+    renderModelsTab();
+  }
+
+  function renderHealthAndKPIs() {
+    const st = state.status;
+    const mt = state.metrics;
+    if (!st || !mt) return;
+
+    const accts = st.accounts || [];
+    const enabled = accts.filter((a) => !a.disabled);
+    const ready = enabled.filter((a) => liveCooldownRemaining(a) === 0);
+    const cooling = enabled.length - ready.length;
+
+    $("nav-acct-count").textContent = String(accts.length);
+
+    if (enabled.length === 0) {
+      setHealthPill("err", "无可用账号");
+    } else if (ready.length === 0) {
+      setHealthPill("warn", "全部冷却中");
+    } else {
+      setHealthPill("ok", `运行中 · ${ready.length}/${enabled.length}`);
+    }
+
+    $("kpi-accounts").textContent = `${ready.length} / ${enabled.length}`;
+    $("kpi-accounts-sub").textContent = `WS 连接 ${st.active_connections || 0}` + (cooling > 0 ? ` · 冷却 ${cooling}` : " · 全部健康");
+
+    const t = mt.totals || {};
+    $("kpi-requests").textContent = fmtNum(t.requests);
+    const succText = t.requests > 0 ? `${t.success_rate_percent.toFixed(1)}%` : "--";
+    $("kpi-requests-sub").textContent = `成功率 ${succText} · 进行中 ${mt.active_turns || 0}` + (t.errors > 0 ? ` · 异常 ${t.errors}` : "");
+
+    $("kpi-tokens").textContent = fmtCompact(t.total_tokens);
+    const cacheText = t.total_tokens > 0 ? `${t.cache_hit_rate_percent.toFixed(1)}%` : "--";
+    $("kpi-tokens-sub").textContent = `缓存命中 ${cacheText} · 输出 ${fmtCompact(t.output_tokens)}`;
+
+    $("kpi-latency").textContent = fmtLatency(t.avg_latency_ms);
+    const costStr = t.cost_usd > 0 ? ` · 成本 $${t.cost_usd.toFixed(4)}` : "";
+    $("kpi-latency-sub").textContent = `运行 ${fmtDuration(mt.uptime_sec)}${costStr}`;
+  }
+
+  /* 24h Tufte SVG Chart */
+  function renderHourlyChart() {
+    const container = $("hourly-chart");
+    const mt = state.metrics;
+    if (!mt || !mt.hourly || mt.hourly.length === 0) {
+      container.innerHTML = '<div class="empty-state">暂无时段数据</div>';
+      return;
+    }
+    const mode = state.chartMode;
+    $("chart-subtitle").textContent = mode === "requests" ? "按小时汇总请求量与异常（悬停查看详情）" : "按小时汇总 Token 消耗（深色：新输入+输出，灰蓝：缓存读取）";
+
+    const data = mt.hourly;
+    const W = 640;
+    const H = 196;
+    const padL = 38;
+    const padR = 10;
+    const padT = 18;
+    const padB = 26;
+    const plotW = W - padL - padR;
+    const plotH = H - padT - padB;
+    const step = plotW / data.length;
+    const barW = Math.max(6, Math.min(18, step * 0.56));
+
+    let maxVal = 0;
+    for (const d of data) {
+      const v = mode === "requests" ? d.requests : (d.input_tokens + d.cache_read_tokens + d.output_tokens);
+      if (v > maxVal) maxVal = v;
+    }
+    if (maxVal === 0) maxVal = 1;
+
+    const parts = [];
+    parts.push(`<svg viewBox="0 0 ${W} ${H}" role="img" aria-label="24小时趋势柱状图">`);
+
+    // Subtle Tufte reference hairlines (0, 50%, 100%)
+    [0, 0.5, 1].forEach((f) => {
+      const y = padT + plotH * (1 - f);
+      const label = f === 0 ? "0" : (mode === "requests" ? fmtNum(Math.round(maxVal * f)) : fmtCompact(Math.round(maxVal * f)));
+      parts.push(`<line x1="${padL}" y1="${y.toFixed(1)}" x2="${W - padR}" y2="${y.toFixed(1)}" stroke="var(--border)" stroke-width="1" ${f > 0 ? 'stroke-dasharray="2 3"' : ""} />`);
+      parts.push(`<text x="${padL - 6}" y="${(y + 3.5).toFixed(1)}" text-anchor="end" font-size="10" fill="var(--ink-muted)" font-family="var(--font-mono)">${esc(label)}</text>`);
+    });
+
+    data.forEach((d, i) => {
+      const slotX = padL + i * step;
+      const barX = slotX + (step - barW) / 2;
+
+      // Hover hit target
+      parts.push(`<rect class="chart-bar-bg" data-idx="${i}" x="${slotX.toFixed(1)}" y="${padT}" width="${step.toFixed(1)}" height="${plotH}" rx="3" />`);
+
+      if (mode === "requests") {
+        if (d.requests > 0) {
+          const totalH = Math.max(2, (d.requests / maxVal) * plotH);
+          const errH = d.errors > 0 ? Math.max(2, (d.errors / maxVal) * plotH) : 0;
+          const okH = Math.max(0, totalH - errH);
+          const yTop = padT + plotH - totalH;
+          if (okH > 0) {
+            parts.push(`<rect x="${barX.toFixed(1)}" y="${(yTop + errH).toFixed(1)}" width="${barW.toFixed(1)}" height="${okH.toFixed(1)}" rx="2" fill="var(--ink)" pointer-events="none" />`);
+          }
+          if (errH > 0) {
+            parts.push(`<rect x="${barX.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${errH.toFixed(1)}" rx="2" fill="var(--signal)" pointer-events="none" />`);
+          }
+        }
+      } else {
+        const totalTok = d.input_tokens + d.cache_read_tokens + d.output_tokens;
+        if (totalTok > 0) {
+          const totalH = Math.max(2, (totalTok / maxVal) * plotH);
+          const cacheH = d.cache_read_tokens > 0 ? (d.cache_read_tokens / totalTok) * totalH : 0;
+          const activeH = Math.max(0, totalH - cacheH);
+          const yTop = padT + plotH - totalH;
+          if (cacheH > 0) {
+            parts.push(`<rect x="${barX.toFixed(1)}" y="${(yTop + activeH).toFixed(1)}" width="${barW.toFixed(1)}" height="${cacheH.toFixed(1)}" rx="2" fill="var(--cache)" opacity="0.65" pointer-events="none" />`);
+          }
+          if (activeH > 0) {
+            parts.push(`<rect x="${barX.toFixed(1)}" y="${yTop.toFixed(1)}" width="${barW.toFixed(1)}" height="${Math.max(2, activeH).toFixed(1)}" rx="2" fill="var(--ink)" pointer-events="none" />`);
+          }
+        }
+      }
+
+      // Show x-axis labels every 4 hours plus the latest hour
+      if (i % 4 === 0 || i === data.length - 1) {
+        const cx = slotX + step / 2;
+        parts.push(`<text x="${cx.toFixed(1)}" y="${H - 6}" text-anchor="middle" font-size="10" fill="var(--ink-muted)" font-family="var(--font-mono)">${esc(d.label)}</text>`);
+      }
+    });
+
+    parts.push("</svg>");
+    container.innerHTML = parts.join("");
+
+    const tooltip = $("chart-tooltip");
+    const wrap = container.parentElement;
+    container.querySelectorAll(".chart-bar-bg").forEach((rect) => {
+      rect.addEventListener("mouseenter", (e) => {
+        const d = data[Number(rect.getAttribute("data-idx"))];
+        const totalTok = d.input_tokens + d.cache_read_tokens + d.output_tokens;
+        tooltip.innerHTML = `
+          <div class="mono" style="font-weight:600;margin-bottom:2px">${esc(d.label)}</div>
+          <div class="mono">请求 ${fmtNum(d.requests)}${d.errors > 0 ? ` · 异常 ${fmtNum(d.errors)}` : ""}</div>
+          <div class="mono">Token ${fmtCompact(totalTok)}（缓存 ${fmtCompact(d.cache_read_tokens)} / 输出 ${fmtCompact(d.output_tokens)}）</div>
+        `;
+        tooltip.classList.remove("hidden");
+        positionTooltip(e, wrap, tooltip);
+      });
+      rect.addEventListener("mousemove", (e) => positionTooltip(e, wrap, tooltip));
+      rect.addEventListener("mouseleave", () => tooltip.classList.add("hidden"));
+    });
+  }
+
+  function positionTooltip(e, wrap, tooltip) {
+    const r = wrap.getBoundingClientRect();
+    const x = e.clientX - r.left;
+    const y = e.clientY - r.top;
+    const tw = tooltip.offsetWidth || 180;
+    const left = Math.max(8, Math.min(r.width - tw - 8, x - tw / 2));
+    const top = Math.max(6, y - (tooltip.offsetHeight || 58) - 10);
+    tooltip.style.left = left + "px";
+    tooltip.style.top = top + "px";
+  }
+
+  /* Overview Models */
+  function renderOverviewModels() {
+    const el = $("overview-models");
+    const list = (state.metrics && state.metrics.by_model) || [];
+    if (list.length === 0) {
+      el.innerHTML = '<div class="empty-state">尚无模型调用记录</div>';
+      return;
+    }
+    const maxReq = Math.max(...list.map((m) => m.requests), 1);
+    const totalReq = list.reduce((acc, m) => acc + m.requests, 0) || 1;
+    el.innerHTML = list.slice(0, 6).map((m) => {
+      const pct = Math.max(3, Math.round((m.requests / maxReq) * 100));
+      const share = ((m.requests / totalReq) * 100).toFixed(0);
+      return `
+        <div class="model-bar-item">
+          <div class="model-bar-head">
+            <span class="model-bar-name" title="${esc(m.model)}">${esc(m.model)}</span>
+            <span class="model-bar-stat">${fmtNum(m.requests)} 次 (${share}%) · ${fmtCompact(m.total_tokens)}</span>
+          </div>
+          <div class="progress-track">
+            <div class="progress-fill" style="width:${pct}%"></div>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  /* Overview Accounts Snapshot */
+  function renderOverviewAccounts() {
+    const el = $("overview-accounts");
+    const accts = (state.status && state.status.accounts) || [];
+    if (accts.length === 0) {
+      el.innerHTML = '<div class="empty-state">未配置账号</div>';
+      return;
+    }
+    el.innerHTML = accts.slice(0, 6).map((a) => {
+      const badge = accountStateBadge(a);
+      const q = a.quota;
+      const monthlyText = q ? `月 ${q.monthly_used}/${q.monthly_limit} (${q.monthly_percent}%)` : "月配额未拉取";
+      const sessionText = q ? `会话 ${q.session_used}/${q.session_limit}` : "";
+      const proxyText = a.proxy ? a.proxy : "直连";
+      return `
+        <div class="mini-item">
+          <div class="mini-item-top">
+            <span class="mini-id" title="${esc(a.id)}">${esc(a.id)}</span>
+            <span class="status-pill ${badge.cls}" data-cd-acct="${esc(a.id)}"><span class="dot"></span>${esc(badge.text)}</span>
+          </div>
+          <div class="mini-meta mono">
+            <span>${esc(monthlyText)}</span>
+            ${sessionText ? `<span>${esc(sessionText)}</span>` : ""}
+            <span>${esc(a.region || "us-east-1")}</span>
+            <span title="${esc(proxyText)}">${esc(proxyText)}</span>
+          </div>
+        </div>
+      `;
+    }).join("");
+  }
+
+  /* Overview Recent Requests */
+  function renderOverviewRecent() {
+    const tbody = $("overview-recent");
+    const list = (state.metrics && state.metrics.recent) || [];
+    if (list.length === 0) {
+      tbody.innerHTML = '<tr><td colspan="6"><div class="empty-state">尚无请求记录</div></td></tr>';
+      return;
+    }
+    tbody.innerHTML = list.slice(0, 10).map((r) => {
+      const ok = r.status === "ok";
+      const pill = ok ? '<span class="status-pill pill-ok">200</span>' : `<span class="status-pill pill-err" title="${esc(r.status)}">${esc(r.http_status || r.status)}</span>`;
+      const cacheTag = r.cache_read_tokens > 0 ? ` / <span style="color:var(--cache)">${fmtCompact(r.cache_read_tokens)}</span>` : "";
+      return `
+        <tr>
+          <td class="mono">${esc(fmtClock(r.timestamp))}</td>
+          <td class="mono">${esc(r.model)}</td>
+          <td class="mono">${esc(r.account_id || "-")}</td>
+          <td class="num mono">${fmtCompact(r.total_tokens)}${cacheTag}</td>
+          <td class="num mono">${fmtLatency(r.latency_ms)}</td>
+          <td>${pill}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  /* Accounts Full Tab */
+  function renderAccountsTab() {
+    const grid = $("accounts-grid");
+    const accts = (state.status && state.status.accounts) || [];
+    if (accts.length === 0) {
+      grid.innerHTML = '<div class="panel"><div class="empty-state">暂无账号，请使用 quick2api login / import-desktop 添加后点击「热重载账号」。</div></div>';
+      return;
+    }
+    const usageByAcct = {};
+    ((state.metrics && state.metrics.by_account) || []).forEach((u) => {
+      usageByAcct[u.account_id] = u;
+    });
+
+    grid.innerHTML = accts.map((a) => {
+      const badge = accountStateBadge(a);
+      const q = a.quota;
+      const u = usageByAcct[a.id];
+      const probe = state.probeResults[a.id];
+
+      const monthlyPct = q ? Math.min(100, Math.max(0, q.monthly_percent || (q.monthly_limit > 0 ? Math.round((q.monthly_used / q.monthly_limit) * 100) : 0))) : 0;
+      const sessionPct = q ? Math.min(100, Math.max(0, q.session_percent || (q.session_limit > 0 ? Math.round((q.session_used / q.session_limit) * 100) : 0))) : 0;
+
+      const quotaHTML = q ? `
+        <div class="quota-grid">
+          <div class="quota-box">
+            <div class="quota-row">
+              <span class="quota-label">月度配额</span>
+              <span class="quota-val">${fmtNum(q.monthly_used)} / ${fmtNum(q.monthly_limit)}</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill ${quotaFillClass(monthlyPct)}" style="width:${monthlyPct}%"></div></div>
+            <div class="quota-foot">${monthlyPct}%${q.monthly_resets_at ? " · 重置 " + fmtDateTime(q.monthly_resets_at) : ""}</div>
+          </div>
+          <div class="quota-box">
+            <div class="quota-row">
+              <span class="quota-label">会话配额</span>
+              <span class="quota-val">${fmtNum(q.session_used)} / ${fmtNum(q.session_limit)}</span>
+            </div>
+            <div class="progress-track"><div class="progress-fill ${quotaFillClass(sessionPct)}" style="width:${sessionPct}%"></div></div>
+            <div class="quota-foot">${sessionPct}%${q.session_resume_in_minutes ? ` · ${q.session_resume_in_minutes}m 后恢复` : (q.session_resets_at ? " · 重置 " + fmtClock(q.session_resets_at) : "")}</div>
+          </div>
+        </div>
+      ` : '<div class="meta-text">尚未拉取配额快照，点击上方「拉取实时配额」可立即查询。</div>';
+
+      const tokenTTL = a.access_expires_in_sec > 0 ? fmtDuration(a.access_expires_in_sec) : "已过期（待刷新）";
+      const subText = q && (q.subscription_type || q.trial_status)
+        ? [q.subscription_type, q.trial_status].filter(Boolean).join(" · ")
+        : "--";
+      const reqSummary = u ? `${fmtNum(u.requests)} 次（${fmtCompact(u.total_tokens)}）` : "0 次";
+
+      const probeHTML = probe ? `
+        <div class="probe-result">
+          <span>${probe.ok ? `出口 IP: ${esc(probe.ip)}` : `探测失败: ${esc(probe.error)}`}</span>
+          <span>${probe.ok ? `${probe.latency}ms` : ""}</span>
+        </div>
+      ` : "";
+
+      return `
+        <article class="acct-card">
+          <div class="acct-head">
+            <div style="min-width:0">
+              <div class="acct-title">${esc(a.id)}</div>
+              <div class="acct-sub mono" title="${esc(a.tenant_host || "")}">${esc(a.tenant_host || "-")}</div>
+            </div>
+            <span class="status-pill ${badge.cls}" data-cd-acct="${esc(a.id)}"><span class="dot"></span>${esc(badge.text)}</span>
+          </div>
+          <div class="acct-body">
+            ${quotaHTML}
+            <div class="spec-grid">
+              <div class="spec-item"><span class="spec-k">出口代理</span><span class="spec-v" title="${esc(a.proxy || "直连")}">${esc(a.proxy || "直连")}</span></div>
+              <div class="spec-item"><span class="spec-k">区域 / 订阅</span><span class="spec-v">${esc(a.region || "us-east-1")} · ${esc(subText)}</span></div>
+              <div class="spec-item"><span class="spec-k">Access Token 剩余</span><span class="spec-v">${esc(tokenTTL)}</span></div>
+              <div class="spec-item"><span class="spec-k">本轮请求 / Token</span><span class="spec-v">${esc(reqSummary)}</span></div>
+            </div>
+            ${a.last_error ? `<div class="acct-error">${esc(a.last_error)}</div>` : ""}
+            ${probeHTML}
+          </div>
+          <div class="acct-foot">
+            <button type="button" class="btn btn-secondary btn-sm" data-act="proxy" data-id="${esc(a.id)}">设置代理</button>
+            <button type="button" class="btn btn-secondary btn-sm" data-act="probe" data-id="${esc(a.id)}">探测出口</button>
+            <button type="button" class="btn btn-ghost btn-sm" data-act="reset-cd" data-id="${esc(a.id)}" ${badge.cd > 0 || a.last_error ? "" : "disabled"}>清除冷却</button>
+          </div>
+        </article>
+      `;
+    }).join("");
+  }
+
+  /* Models Tab */
+  function renderModelsTab() {
+    const mt = state.metrics;
+    if (!mt) return;
+    $("metrics-uptime-desc").textContent = `自 ${fmtDateTime(mt.started_at)} 启动以来的内存实时统计（运行时长 ${fmtDuration(mt.uptime_sec)}）`;
+
+    const models = mt.by_model || [];
+    $("model-count-meta").textContent = `${models.length} 个模型`;
+    const mBody = $("models-table-body");
+    if (models.length === 0) {
+      mBody.innerHTML = '<tr><td colspan="11"><div class="empty-state">暂无模型使用数据</div></td></tr>';
+    } else {
+      mBody.innerHTML = models.map((m) => {
+        const succ = m.requests > 0 ? ((m.success / m.requests) * 100).toFixed(1) + "%" : "--";
+        return `
+          <tr>
+            <td class="mono strong-text">${esc(m.model)}</td>
+            <td class="num mono">${fmtNum(m.requests)}</td>
+            <td class="num mono">${succ}</td>
+            <td class="num mono">${fmtCompact(m.input_tokens)}</td>
+            <td class="num mono" style="color:var(--cache)">${fmtCompact(m.cache_read_tokens)}</td>
+            <td class="num mono">${m.cache_hit_rate_percent.toFixed(1)}%</td>
+            <td class="num mono">${fmtCompact(m.output_tokens)}</td>
+            <td class="num mono">${fmtNum(m.tool_call_requests)}</td>
+            <td class="num mono">${fmtLatency(m.avg_latency_ms)}</td>
+            <td class="num mono">${m.cost_usd > 0 ? "$" + m.cost_usd.toFixed(4) : "--"}</td>
+            <td class="num mono">${esc(fmtClock(m.last_used_at))}</td>
+          </tr>
+        `;
+      }).join("");
+    }
+
+    const acctList = mt.by_account || [];
+    $("acct-usage-meta").textContent = `${acctList.length} 个活跃账号`;
+    const aBody = $("acct-usage-body");
+    if (acctList.length === 0) {
+      aBody.innerHTML = '<tr><td colspan="7"><div class="empty-state">暂无账号流量统计</div></td></tr>';
+    } else {
+      aBody.innerHTML = acctList.map((a) => `
+        <tr>
+          <td class="mono strong-text">${esc(a.account_id)}</td>
+          <td class="num mono">${fmtNum(a.requests)}</td>
+          <td class="num mono">${fmtNum(a.success)} / ${fmtNum(a.errors)}</td>
+          <td class="num mono">${a.rate_limited > 0 ? `<span style="color:var(--warn)">${fmtNum(a.rate_limited)}</span>` : "0"}</td>
+          <td class="num mono">${fmtCompact(a.total_tokens)}</td>
+          <td class="num mono">${fmtLatency(a.avg_latency_ms)}</td>
+          <td class="num mono">${esc(fmtClock(a.last_used_at))}</td>
+        </tr>
+      `).join("");
+    }
+
+    // Update model filter options preserving selection
+    const sel = $("recent-model-filter");
+    const prev = sel.value;
+    const modelNames = Array.from(new Set((mt.recent || []).map((r) => r.model))).sort();
+    sel.innerHTML = '<option value="">全部模型</option>' + modelNames.map((n) => `<option value="${esc(n)}">${esc(n)}</option>`).join("");
+    if (modelNames.includes(prev)) sel.value = prev;
+
+    renderRecentFullTable();
+  }
+
+  function renderRecentFullTable() {
+    const list = (state.metrics && state.metrics.recent) || [];
+    const wantModel = $("recent-model-filter").value;
+    const wantStatus = $("recent-status-filter").value;
+    const filtered = list.filter((r) => {
+      if (wantModel && r.model !== wantModel) return false;
+      if (wantStatus === "ok" && r.status !== "ok") return false;
+      if (wantStatus === "err" && r.status === "ok") return false;
+      return true;
+    });
+    const body = $("recent-full-body");
+    if (filtered.length === 0) {
+      body.innerHTML = '<tr><td colspan="8"><div class="empty-state">无匹配的请求记录</div></td></tr>';
+      return;
+    }
+    body.innerHTML = filtered.map((r) => {
+      const ok = r.status === "ok";
+      const pill = ok ? '<span class="status-pill pill-ok">OK</span>' : `<span class="status-pill pill-err">${esc(r.status)}</span>`;
+      const chips = [];
+      if (r.stream) chips.push('<span class="tag-chip">SSE</span>');
+      if (r.tool_calls > 0) chips.push(`<span class="tag-chip">tools:${r.tool_calls}</span>`);
+      const shortID = (r.id || "").replace(/^chatcmpl-/, "").slice(0, 10) || "-";
+      return `
+        <tr>
+          <td class="mono">${esc(fmtClock(r.timestamp))}</td>
+          <td class="mono" style="color:var(--ink-muted)" title="${esc(r.id || "")}">${esc(shortID)}</td>
+          <td class="mono">${esc(r.model)}</td>
+          <td class="mono">${esc(r.account_id || "-")}</td>
+          <td>${chips.join(" ") || "-"}</td>
+          <td class="num mono">${fmtCompact(r.input_tokens)} / <span style="color:var(--cache)">${fmtCompact(r.cache_read_tokens)}</span> / ${fmtCompact(r.output_tokens)}</td>
+          <td class="num mono">${fmtLatency(r.latency_ms)}</td>
+          <td>${pill}</td>
+        </tr>
+      `;
+    }).join("");
+  }
+
+  /* Logs Tab */
+  function getFilteredLogs() {
+    const q = state.logSearch.trim().toLowerCase();
+    return state.logs.filter((e) => {
+      if (state.logLevel !== "all" && e.level !== state.logLevel) return false;
+      if (state.logTag !== "all" && e.tag !== state.logTag) return false;
+      if (q && !e.message.toLowerCase().includes(q) && !e.tag.toLowerCase().includes(q)) return false;
+      return true;
+    });
+  }
+
+  function renderLogs() {
+    const errCount = state.logs.filter((e) => e.level === "error").length;
+    const errBadge = $("nav-log-err");
+    if (errCount > 0) {
+      errBadge.textContent = String(errCount);
+      errBadge.classList.remove("hidden");
+    } else {
+      errBadge.classList.add("hidden");
+    }
+
+    const sel = $("log-tag-filter");
+    const curTag = state.logTag;
+    sel.innerHTML = '<option value="all">全部模块</option>' + state.logTags.map((t) => `<option value="${esc(t)}">${esc(t)}</option>`).join("");
+    if (state.logTags.includes(curTag)) sel.value = curTag;
+
+    const filtered = getFilteredLogs();
+    $("logs-meta").textContent = `缓冲 ${state.logTotalBuffered} 条 · 当前显示 ${filtered.length} 条 · 自动脱敏 Token 与代理凭据`;
+
+    const viewer = $("log-viewer");
+    if (filtered.length === 0) {
+      viewer.innerHTML = '<div class="empty-state">暂无符合条件的运行日志</div>';
+      return;
+    }
+    viewer.innerHTML = filtered.map((e) => `
+      <div class="log-row">
+        <span class="log-seq">#${e.seq}</span>
+        <span class="log-time">${esc(fmtISOTime(e.time))}</span>
+        <span class="log-lvl ${esc(e.level)}">${esc(e.level)}</span>
+        <span class="log-tag" title="${esc(e.tag)}">[${esc(e.tag)}]</span>
+        <span class="log-msg">${esc(e.message)}</span>
+      </div>
+    `).join("");
+
+    if ($("log-autoscroll").checked) {
+      viewer.scrollTop = viewer.scrollHeight;
+    }
+  }
+
+  /* 1-second local countdown tick */
+  function tickCountdowns() {
+    if (!state.status || !state.status.accounts) return;
+    let needsRerender = false;
+    state.status.accounts.forEach((a) => {
+      if ((a.cooldown_remaining_sec || 0) <= 0) return;
+      const badge = accountStateBadge(a);
+      document.querySelectorAll(`[data-cd-acct="${CSS.escape(a.id)}"]`).forEach((el) => {
+        el.className = "status-pill " + badge.cls;
+        el.innerHTML = `<span class="dot"></span>${esc(badge.text)}`;
+      });
+      if (badge.cd === 0) needsRerender = true;
+    });
+    if (needsRerender) {
+      renderHealthAndKPIs();
+    }
+  }
+
+  /* Actions */
+  function switchTab(tab) {
+    state.activeTab = tab;
+    document.querySelectorAll(".nav-tab").forEach((b) => {
+      const active = b.getAttribute("data-tab") === tab;
+      b.classList.toggle("active", active);
+      b.setAttribute("aria-selected", active ? "true" : "false");
+    });
+    document.querySelectorAll(".tab-view").forEach((v) => {
+      v.classList.toggle("active", v.id === "view-" + tab);
+    });
+    if (tab === "logs" && state.logs.length === 0) {
+      fetchLogs(true);
+    }
+  }
+
+  function openProxyModal(acctId) {
+    state.proxyModalAcctId = acctId;
+    $("proxy-acct-id").textContent = acctId;
+    const acct = ((state.status && state.status.accounts) || []).find((a) => a.id === acctId);
+    const cur = acct && acct.proxy ? acct.proxy.replace(/\s*\(global\)$/, "") : "";
+    $("proxy-url-input").value = acct && acct.proxy && acct.proxy.endsWith("(global)") ? "" : cur;
+    $("proxy-error").classList.add("hidden");
+    $("proxy-modal").classList.remove("hidden");
+    $("proxy-url-input").focus();
+  }
+
+  function closeProxyModal() {
+    $("proxy-modal").classList.add("hidden");
+    state.proxyModalAcctId = "";
+  }
+
+  async function probeAccountProxy(acctId, btn) {
+    if (btn) {
+      btn.disabled = true;
+      btn.textContent = "探测中...";
+    }
+    try {
+      const res = await apiFetch("/admin/accounts/probe-proxy", {
+        method: "POST",
+        body: { id: acctId },
+      });
+      state.probeResults[acctId] = { ok: true, ip: res.egress_ip, latency: res.latency_ms };
+      toast(`${acctId} 出口正常: ${res.egress_ip} (${res.latency_ms}ms)`);
+    } catch (err) {
+      if (err.message !== "unauthorized") {
+        state.probeResults[acctId] = { ok: false, error: err.message };
+        toast(`出口探测失败: ${err.message}`, true);
+      }
+    } finally {
+      renderAccountsTab();
+    }
+  }
+
+  async function resetAccountCooldown(acctId) {
+    try {
+      const res = await apiFetch("/admin/accounts/reset-cooldown", {
+        method: "POST",
+        body: acctId ? { id: acctId } : {},
+      });
+      toast(acctId ? `已清除 ${acctId} 冷却状态` : `已清除 ${res.cleared || 0} 个账号的冷却状态`);
+      await fetchCore(false);
+    } catch (err) {
+      if (err.message !== "unauthorized") toast("清除冷却失败: " + err.message, true);
+    }
+  }
+
+  /* Timers */
+  function startTimers() {
+    stopTimers();
+    if (state.autoRefresh) {
+      pollTimer = setInterval(() => {
+        if (state.authenticated && !document.hidden) fetchCore(false);
+      }, 5000);
+    }
+    logTimer = setInterval(() => {
+      if (state.authenticated && !state.logPaused && !document.hidden) fetchLogs(false);
+    }, 3000);
+    tickTimer = setInterval(tickCountdowns, 1000);
+  }
+
+  function stopTimers() {
+    if (pollTimer) { clearInterval(pollTimer); pollTimer = null; }
+    if (logTimer) { clearInterval(logTimer); logTimer = null; }
+    if (tickTimer) { clearInterval(tickTimer); tickTimer = null; }
+  }
+
+  /* Event Bindings */
+  function bindEvents() {
+    // Tabs & goto links
+    document.querySelectorAll(".nav-tab").forEach((b) => {
+      b.addEventListener("click", () => switchTab(b.getAttribute("data-tab")));
+    });
+    document.querySelectorAll("[data-goto]").forEach((b) => {
+      b.addEventListener("click", () => switchTab(b.getAttribute("data-goto")));
+    });
+
+    // Topbar controls
+    $("btn-autorefresh").addEventListener("click", () => {
+      state.autoRefresh = !state.autoRefresh;
+      $("btn-autorefresh").classList.toggle("active", state.autoRefresh);
+      $("autorefresh-label").textContent = state.autoRefresh ? "自动 5s" : "已暂停";
+      startTimers();
+    });
+
+    $("btn-refresh").addEventListener("click", async () => {
+      await fetchCore(false);
+      await fetchLogs(false);
+      toast("数据已刷新");
+    });
+
+    $("btn-theme").addEventListener("click", () => {
+      const next = document.documentElement.getAttribute("data-theme") === "dark" ? "light" : "dark";
+      localStorage.setItem(THEME_STORAGE, next);
+      applyTheme(next);
+    });
+
+    $("btn-logout").addEventListener("click", () => {
+      state.apiKey = "";
+      state.authenticated = false;
+      sessionStorage.removeItem(KEY_STORAGE);
+      localStorage.removeItem(KEY_STORAGE);
+      $("auth-key-input").value = "";
+      $("btn-logout").classList.add("hidden");
+      showAuthGate("");
+    });
+
+    // Auth gate form
+    $("auth-toggle-vis").addEventListener("click", () => {
+      const inp = $("auth-key-input");
+      const show = inp.type === "password";
+      inp.type = show ? "text" : "password";
+      $("auth-toggle-vis").textContent = show ? "隐藏" : "显示";
+    });
+
+    $("auth-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const key = $("auth-key-input").value.trim();
+      if (!key) return;
+      const btn = $("auth-submit");
+      btn.disabled = true;
+      btn.textContent = "验证中...";
+      state.apiKey = key;
+      try {
+        await fetchCore(false);
+        if ($("auth-remember").checked) {
+          localStorage.setItem(KEY_STORAGE, key);
+          sessionStorage.removeItem(KEY_STORAGE);
+        } else {
+          sessionStorage.setItem(KEY_STORAGE, key);
+          localStorage.removeItem(KEY_STORAGE);
+        }
+        await fetchLogs(true);
+        startTimers();
+        toast("已连接到 quick2api");
+      } catch (_) {
+        state.apiKey = "";
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "验证并进入";
+      }
+    });
+
+    // Chart mode toggle
+    document.querySelectorAll("[data-chart-mode]").forEach((b) => {
+      b.addEventListener("click", () => {
+        state.chartMode = b.getAttribute("data-chart-mode");
+        document.querySelectorAll("[data-chart-mode]").forEach((x) => x.classList.toggle("active", x === b));
+        renderHourlyChart();
+      });
+    });
+
+    // Accounts tab global actions
+    $("btn-fetch-usage").addEventListener("click", async () => {
+      const btn = $("btn-fetch-usage");
+      btn.disabled = true;
+      btn.textContent = "拉取中...";
+      try {
+        await fetchCore(true);
+        toast("实时配额快照已更新");
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "拉取实时配额";
+      }
+    });
+
+    $("btn-reload-accounts").addEventListener("click", async () => {
+      const btn = $("btn-reload-accounts");
+      btn.disabled = true;
+      try {
+        const res = await apiFetch("/admin/reload", { method: "POST" });
+        const r = res.reload || {};
+        toast(`热重载完成：共 ${r.total || 0} 个（可用 ${r.enabled || 0}）`);
+        await fetchCore(false);
+        await fetchLogs(false);
+      } catch (err) {
+        if (err.message !== "unauthorized") toast("热重载失败: " + err.message, true);
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    $("btn-reset-all-cd").addEventListener("click", () => resetAccountCooldown(""));
+
+    // Delegated account card buttons
+    $("accounts-grid").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-act]");
+      if (!btn) return;
+      const act = btn.getAttribute("data-act");
+      const id = btn.getAttribute("data-id");
+      if (act === "proxy") openProxyModal(id);
+      else if (act === "probe") probeAccountProxy(id, btn);
+      else if (act === "reset-cd") resetAccountCooldown(id);
+    });
+
+    // Proxy modal
+    $("proxy-modal-close").addEventListener("click", closeProxyModal);
+    $("proxy-cancel").addEventListener("click", closeProxyModal);
+    $("proxy-modal").addEventListener("click", (e) => {
+      if (e.target === $("proxy-modal")) closeProxyModal();
+    });
+    document.querySelectorAll("[data-proxy-preset]").forEach((b) => {
+      b.addEventListener("click", () => {
+        $("proxy-url-input").value = b.getAttribute("data-proxy-preset");
+        $("proxy-url-input").focus();
+      });
+    });
+    $("proxy-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const id = state.proxyModalAcctId;
+      if (!id) return;
+      const proxyURL = $("proxy-url-input").value.trim();
+      const btn = $("proxy-save");
+      btn.disabled = true;
+      $("proxy-error").classList.add("hidden");
+      try {
+        await apiFetch("/admin/accounts/proxy", {
+          method: "POST",
+          body: { id, proxy_url: proxyURL },
+        });
+        delete state.probeResults[id];
+        closeProxyModal();
+        toast(`已更新 ${id} 代理配置`);
+        await fetchCore(false);
+      } catch (err) {
+        if (err.message !== "unauthorized") {
+          $("proxy-error").textContent = err.message;
+          $("proxy-error").classList.remove("hidden");
+        }
+      } finally {
+        btn.disabled = false;
+      }
+    });
+
+    // Models filters & reset
+    $("recent-model-filter").addEventListener("change", renderRecentFullTable);
+    $("recent-status-filter").addEventListener("change", renderRecentFullTable);
+    $("btn-reset-metrics").addEventListener("click", async () => {
+      if (!window.confirm("确认重置当前内存中的请求与模型统计？")) return;
+      try {
+        await apiFetch("/admin/metrics/reset", { method: "POST" });
+        toast("模型统计已重置");
+        await fetchCore(false);
+      } catch (err) {
+        if (err.message !== "unauthorized") toast("重置失败: " + err.message, true);
+      }
+    });
+
+    // Logs toolbar
+    $("log-level-group").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-level]");
+      if (!btn) return;
+      state.logLevel = btn.getAttribute("data-level");
+      $("log-level-group").querySelectorAll(".seg-btn").forEach((x) => x.classList.toggle("active", x === btn));
+      renderLogs();
+    });
+    $("log-tag-filter").addEventListener("change", () => {
+      state.logTag = $("log-tag-filter").value;
+      renderLogs();
+    });
+    $("log-search").addEventListener("input", () => {
+      state.logSearch = $("log-search").value;
+      renderLogs();
+    });
+    $("btn-logs-pause").addEventListener("click", () => {
+      state.logPaused = !state.logPaused;
+      $("btn-logs-pause").textContent = state.logPaused ? "继续跟踪" : "暂停跟踪";
+    });
+    $("btn-logs-copy").addEventListener("click", async () => {
+      const lines = getFilteredLogs().map((e) => `${e.time} [${e.level.toUpperCase()}] [${e.tag}] ${e.message}`).join("\n");
+      if (!lines) {
+        toast("没有可复制的日志");
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(lines);
+        toast(`已复制 ${getFilteredLogs().length} 条日志`);
+      } catch (_) {
+        toast("剪贴板不可用", true);
+      }
+    });
+    $("btn-logs-clear").addEventListener("click", async () => {
+      try {
+        await apiFetch("/admin/logs/clear", { method: "POST" });
+        state.logs = [];
+        state.logTotalBuffered = 0;
+        renderLogs();
+        toast("已清空日志缓冲");
+      } catch (err) {
+        if (err.message !== "unauthorized") toast("清空失败: " + err.message, true);
+      }
+    });
+
+    // Escape closes proxy modal
+    document.addEventListener("keydown", (e) => {
+      if (e.key === "Escape" && !$("proxy-modal").classList.contains("hidden")) {
+        closeProxyModal();
+      }
+    });
+  }
+
+  /* Boot */
+  async function boot() {
+    initTheme();
+    bindEvents();
+    try {
+      await fetchCore(false);
+      await fetchLogs(true);
+      startTimers();
+    } catch (_) {
+      // auth gate shown automatically on 401
+    }
+  }
+
+  boot();
+})();

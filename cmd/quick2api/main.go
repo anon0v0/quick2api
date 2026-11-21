@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"flag"
+	"io"
 	"log"
 	"net"
 	"net/http"
@@ -12,11 +13,13 @@ import (
 	"sync"
 	"syscall"
 	"time"
+
 	"quick2api/internal/auth"
 	"quick2api/internal/cli"
 	"quick2api/internal/config"
 	"quick2api/internal/quick"
 	"quick2api/internal/server"
+	"quick2api/internal/telemetry"
 )
 
 func main() {
@@ -42,6 +45,8 @@ func main() {
 		flag.PrintDefaults()
 	}
 	flag.Parse()
+	logBuf := telemetry.NewLogBuffer(1000)
+	log.SetOutput(io.MultiWriter(os.Stderr, logBuf))
 
 	cfg, err := config.Load(*configPath)
 	if err != nil {
@@ -65,8 +70,8 @@ func main() {
 	store.StartBackgroundRefresher(bgCtx)
 
 	handler := server.New(cfg, store, manager)
+	handler.SetLogBuffer(logBuf)
 	watchReloadSignal(bgCtx, handler.ReloadAccounts)
-
 	httpServers := make([]*http.Server, 0, len(cfg.ListenAddrs))
 	var wg sync.WaitGroup
 
@@ -81,8 +86,7 @@ func main() {
 			IdleTimeout:       120 * time.Second,
 		}
 		httpServers = append(httpServers, srv)
-		log.Printf("[quick2api] listening on http://%s", addr)
-
+		log.Printf("[quick2api] listening on http://%s (admin console: http://%s/admin/)", addr, addr)
 		wg.Add(1)
 		go func(a string, l net.Listener, s *http.Server) {
 			defer wg.Done()

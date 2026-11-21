@@ -15,6 +15,7 @@ import (
 	"quick2api/internal/config"
 	"quick2api/internal/prompt"
 	"quick2api/internal/quick"
+	"quick2api/internal/telemetry"
 )
 
 func newTestServer(t *testing.T) *Server {
@@ -375,5 +376,101 @@ func TestServeDifferentiatedCooldownRateLimitVsUsageBlocked(t *testing.T) {
 	st = srv.store.Statuses()[0]
 	if st.CooldownKind != auth.CooldownMonthlyQuota || st.CooldownRemainingSec < 3*3600 {
 		t.Fatalf("expected monthly_quota cooldown >=3h, got %+v", st)
+	}
+}
+
+func TestWebUIRoutesAndTelemetryEndpoints(t *testing.T) {
+	srv := newTestServer(t)
+	buf := telemetry.NewLogBuffer(100)
+	_, _ = buf.Write([]byte("2026/11/22 03:30:00 [chat] sample info line\n"))
+	_, _ = buf.Write([]byte("2026/11/22 03:30:01 [auth] refresh failed error\n"))
+	srv.SetLogBuffer(buf)
+
+	// 1. Root & /admin redirect to /admin/; unknown path stays 404.
+	for _, p := range []string{"/", "/admin"} {
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, httptest.NewRequest(http.MethodGet, p, nil))
+		if w.Code != http.StatusFound || w.Header().Get("Location") != "/admin/" {
+			t.Fatalf("expected 302 -> /admin/ for %s, got %d loc=%q", p, w.Code, w.Header().Get("Location"))
+		}
+	}
+	w404 := httptest.NewRecorder()
+	srv.ServeHTTP(w404, httptest.NewRequest(http.MethodGet, "/does-not-exist", nil))
+	if w404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 for unknown path, got %d", w404.Code)
+	}
+
+	// 2. Embedded WebUI index + CSS + JS with security headers.
+	wUI := httptest.NewRecorder()
+	srv.ServeHTTP(wUI, httptest.NewRequest(http.MethodGet, "/admin/", nil))
+	if wUI.Code != http.StatusOK || !strings.Contains(wUI.Body.String(), "quick2api") {
+		t.Fatalf("unexpected /admin/ response: %d", wUI.Code)
+	}
+	if wUI.Header().Get("X-Frame-Options") != "DENY" || wUI.Header().Get("X-Content-Type-Options") != "nosniff" {
+		t.Fatalf("missing security headers on /admin/: %v", wUI.Header())
+	}
+	for _, asset := range []string{"/admin/assets/style.css", "/admin/assets/app.js"} {
+		wa := httptest.NewRecorder()
+		srv.ServeHTTP(wa, httptest.NewRequest(http.MethodGet, asset, nil))
+		if wa.Code != http.StatusOK || wa.Body.Len() < 100 {
+			t.Fatalf("expected embedded asset %s to load, got %d len=%d", asset, wa.Code, wa.Body.Len())
+		}
+	}
+
+	// 3. /admin/metrics & /admin/logs require auth.
+	for _, ep := range []string{"/admin/metrics", "/admin/logs"} {
+		wu := httptest.NewRecorder()
+		srv.ServeHTTP(wu, httptest.NewRequest(http.MethodGet, ep, nil))
+		if wu.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 without auth on %s, got %d", ep, wu.Code)
+		}
+	}
+
+	// Record one chat completion metric and verify /admin/metrics + reset.
+	srv.recordChatMetrics("chatcmpl-m1", "quick-opus-5.5", "t1", true, time.Now().Add(-250*time.Millisecond), "ok", http.StatusOK, &quick.TurnUsage{
+		InputTokens:     500,
+		CacheReadTokens: 66000,
+		OutputTokens:    120,
+		CostUSD:         0.01,
+	}, 1)
+
+	authReq := func(method, path string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(method, path, nil)
+		req.Header.Set("Authorization", "Bearer sk-test-secret")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		return w
+	}
+
+	wm := authReq(http.MethodGet, "/admin/metrics")
+	if wm.Code != http.StatusOK || wm.Header().Get("Cache-Control") != "no-store" {
+		t.Fatalf("unexpected /admin/metrics: %d cc=%q", wm.Code, wm.Header().Get("Cache-Control"))
+	}
+	var snap telemetry.MetricsSnapshot
+	if err := json.Unmarshal(wm.Body.Bytes(), &snap); err != nil {
+		t.Fatal(err)
+	}
+	if snap.Totals.Requests != 1 || snap.Totals.ToolCallRequests != 1 || len(snap.ByModel) != 1 || snap.ByModel[0].Model != "quick-opus-5.5" {
+		t.Fatalf("unexpected metrics snapshot: %+v", snap)
+	}
+
+	// Verify /admin/logs filtering + clear.
+	wl := authReq(http.MethodGet, "/admin/logs?level=error")
+	if wl.Code != http.StatusOK {
+		t.Fatalf("unexpected /admin/logs: %d %s", wl.Code, wl.Body.String())
+	}
+	var logPage telemetry.LogPage
+	if err := json.Unmarshal(wl.Body.Bytes(), &logPage); err != nil {
+		t.Fatal(err)
+	}
+	if len(logPage.Entries) != 1 || logPage.Entries[0].Tag != "auth" {
+		t.Fatalf("expected 1 error log entry from auth, got %+v", logPage.Entries)
+	}
+
+	if wr := authReq(http.MethodPost, "/admin/metrics/reset"); wr.Code != http.StatusOK {
+		t.Fatalf("metrics reset failed: %d", wr.Code)
+	}
+	if wc := authReq(http.MethodPost, "/admin/logs/clear"); wc.Code != http.StatusOK {
+		t.Fatalf("logs clear failed: %d", wc.Code)
 	}
 }

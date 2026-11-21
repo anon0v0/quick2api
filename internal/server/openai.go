@@ -9,6 +9,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -18,6 +19,8 @@ import (
 	"quick2api/internal/netproxy"
 	"quick2api/internal/prompt"
 	"quick2api/internal/quick"
+	"quick2api/internal/telemetry"
+	"quick2api/internal/webui"
 )
 
 // Server serves OpenAI-compatible HTTP endpoints backed by Amazon Quick.
@@ -25,6 +28,8 @@ type Server struct {
 	cfg      config.Config
 	store    *auth.Store
 	manager  *quick.Manager
+	metrics  *telemetry.Metrics
+	logs     *telemetry.LogBuffer
 	sem      chan struct{}
 	mux      *http.ServeMux
 	imgHTTP  *http.Client
@@ -37,21 +42,51 @@ func New(cfg config.Config, store *auth.Store, manager *quick.Manager) *Server {
 		cfg:      cfg,
 		store:    store,
 		manager:  manager,
+		metrics:  telemetry.NewMetrics(),
+		logs:     telemetry.NewLogBuffer(1000),
 		sem:      make(chan struct{}, cfg.MaxConcurrentTurn),
 		mux:      http.NewServeMux(),
 		imgHTTP:  &http.Client{Timeout: 15 * time.Second},
 		probeURL: "https://api.ipify.org?format=json",
 	}
+	uiHandler := webui.Handler()
+	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/" {
+			http.Redirect(w, r, "/admin/", http.StatusFound)
+			return
+		}
+		http.NotFound(w, r)
+	})
+	s.mux.HandleFunc("/admin", func(w http.ResponseWriter, r *http.Request) {
+		http.Redirect(w, r, "/admin/", http.StatusFound)
+	})
+	s.mux.Handle("/admin/", uiHandler)
 	s.mux.HandleFunc("/healthz", s.handleHealth)
 	s.mux.HandleFunc("/v1/models", s.withAuth(s.handleModels))
 	s.mux.HandleFunc("/v1/models/", s.withAuth(s.handleModelGet))
 	s.mux.HandleFunc("/v1/chat/completions", s.withAuth(s.handleChatCompletions))
 	s.mux.HandleFunc("/admin/status", s.withAuth(s.handleAdminStatus))
+	s.mux.HandleFunc("/admin/metrics", s.withAuth(s.handleAdminMetrics))
+	s.mux.HandleFunc("/admin/metrics/reset", s.withAuth(s.handleAdminMetricsReset))
+	s.mux.HandleFunc("/admin/logs", s.withAuth(s.handleAdminLogs))
+	s.mux.HandleFunc("/admin/logs/clear", s.withAuth(s.handleAdminLogsClear))
 	s.mux.HandleFunc("/admin/reload", s.withAuth(s.handleAdminReload))
 	s.mux.HandleFunc("/admin/accounts/proxy", s.withAuth(s.handleAdminAccountProxy))
 	s.mux.HandleFunc("/admin/accounts/probe-proxy", s.withAuth(s.handleAdminProbeProxy))
 	s.mux.HandleFunc("/admin/accounts/reset-cooldown", s.withAuth(s.handleAdminResetCooldown))
 	return s
+}
+
+// SetLogBuffer attaches the shared process log ring buffer to /admin/logs.
+func (s *Server) SetLogBuffer(buf *telemetry.LogBuffer) {
+	if buf != nil {
+		s.logs = buf
+	}
+}
+
+// Metrics returns the server's in-memory telemetry collector.
+func (s *Server) Metrics() *telemetry.Metrics {
+	return s.metrics
 }
 
 // ReloadAccounts atomically reloads accounts.json and reconciles cached WebSocket connections.
@@ -158,9 +193,68 @@ func (s *Server) handleAdminStatus(w http.ResponseWriter, r *http.Request) {
 		resp["usage"] = usages
 		resp["accounts"] = s.store.Statuses()
 	}
+	w.Header().Set("Cache-Control", "no-store")
 	writeJSON(w, http.StatusOK, resp)
 }
 
+func (s *Server) handleAdminMetrics(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only GET is allowed.")
+		return
+	}
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, s.metrics.Snapshot())
+}
+
+func (s *Server) handleAdminMetricsReset(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	s.metrics.Reset()
+	log.Printf("[admin] reset in-memory usage metrics")
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
+
+func (s *Server) handleAdminLogs(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodGet {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only GET is allowed.")
+		return
+	}
+	q := r.URL.Query()
+	var since uint64
+	if v := strings.TrimSpace(q.Get("since")); v != "" {
+		if n, err := strconv.ParseUint(v, 10, 64); err == nil {
+			since = n
+		}
+	}
+	limit := 200
+	if v := strings.TrimSpace(q.Get("limit")); v != "" {
+		if n, err := strconv.Atoi(v); err == nil && n > 0 {
+			limit = n
+		}
+	}
+	page := s.logs.Query(telemetry.LogQuery{
+		Since:  since,
+		Level:  q.Get("level"),
+		Tag:    q.Get("tag"),
+		Search: q.Get("q"),
+		Limit:  limit,
+	})
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, page)
+}
+
+func (s *Server) handleAdminLogsClear(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost {
+		writeOpenAIError(w, http.StatusMethodNotAllowed, "method_not_allowed", "invalid_request_error", "Only POST is allowed.")
+		return
+	}
+	s.logs.Clear()
+	w.Header().Set("Cache-Control", "no-store")
+	writeJSON(w, http.StatusOK, map[string]any{"status": "ok"})
+}
 func decodeStrictJSON(r *http.Request, maxBytes int64, dst any) error {
 	body, err := io.ReadAll(io.LimitReader(r.Body, maxBytes+1))
 	if err != nil {
@@ -426,6 +520,9 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 		modelEcho = target.CanonicalID
 	}
 	includeUsage := req.StreamOptions != nil && req.StreamOptions.IncludeUsage
+	reqStart := time.Now()
+	s.metrics.StartTurn()
+	defer s.metrics.EndTurn()
 
 	triedAccounts := make(map[string]bool)
 	maxRotate := s.store.AccountCount()
@@ -452,6 +549,7 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 					msg = lastRotateErr
 				}
 			}
+			s.recordChatMetrics(chatID, modelEcho, "", req.Stream, reqStart, errCode, status, nil, 0)
 			writeOpenAIError(w, status, errCode, errType, msg)
 			return
 		}
@@ -478,16 +576,43 @@ func (s *Server) handleChatCompletions(w http.ResponseWriter, r *http.Request) {
 			log.Printf("[chat] rotating away from rate-limited account=%s", acct.ID)
 			continue
 		default:
+			s.recordChatMetrics(chatID, modelEcho, acct.ID, req.Stream, reqStart, retryAction.status, retryAction.httpStatus, retryAction.usage, retryAction.toolCalls)
 			return
 		}
 	}
 }
 
 type retryDirective struct {
-	kind   string // "", "stale_conn", "rotate_account"
-	errMsg string
+	kind       string // "", "stale_conn", "rotate_account"
+	errMsg     string
+	status     string // "ok" or error code
+	httpStatus int
+	usage      *quick.TurnUsage
+	toolCalls  int
 }
 
+func (s *Server) recordChatMetrics(id, modelName, acctID string, stream bool, start time.Time, status string, httpStatus int, u *quick.TurnUsage, toolCalls int) {
+	rec := telemetry.RequestRecord{
+		ID:         id,
+		Timestamp:  time.Now().Unix(),
+		Model:      modelName,
+		AccountID:  acctID,
+		Stream:     stream,
+		ToolCalls:  toolCalls,
+		Status:     status,
+		HTTPStatus: httpStatus,
+		LatencyMs:  time.Since(start).Milliseconds(),
+	}
+	if u != nil {
+		rec.InputTokens = u.InputTokens
+		rec.OutputTokens = u.OutputTokens
+		rec.CacheReadTokens = u.CacheReadTokens
+		rec.CacheWriteTokens = u.CacheWriteTokens
+		rec.TotalTokens = u.InputTokens + u.CacheReadTokens + u.CacheWriteTokens + u.OutputTokens
+		rec.CostUSD = u.CostUSD
+	}
+	s.metrics.Record(rec)
+}
 func (s *Server) startTurnWithRetry(ctx context.Context, target models.ResolvedTarget, converted prompt.ConvertedPrompt, exclude map[string]bool) (auth.Account, <-chan quick.StreamEvent, error) {
 	acct, err := s.store.PickAccountExcluding(ctx, exclude)
 	if err != nil {
@@ -738,6 +863,7 @@ func (s *Server) serveSSE(
 	stopFilter := prompt.NewStopFilter(stops)
 	var lastUsage *quick.TurnUsage
 	finishReason := "stop"
+	toolCallCount := 0
 
 	emitParsed := func(textOut string, calls []prompt.ParsedToolCall) bool {
 		if textOut != "" {
@@ -754,6 +880,7 @@ func (s *Server) serveSSE(
 		}
 		for _, tc := range calls {
 			emittedOutput = true
+			toolCallCount++
 			idx := tc.Index
 			writeChunk(map[string]any{
 				"tool_calls": []prompt.ToolCall{{
@@ -806,7 +933,7 @@ func (s *Server) serveSSE(
 			case "guardrail_blocked":
 				if !headersSent {
 					writeOpenAIError(w, http.StatusBadRequest, "content_filter", "invalid_request_error", ev.ErrorMsg)
-					return retryDirective{}
+					return retryDirective{status: "content_filter", httpStatus: http.StatusBadRequest, usage: lastUsage, toolCalls: toolCallCount}
 				}
 				emittedOutput = true
 				finishReason = "content_filter"
@@ -818,10 +945,10 @@ func (s *Server) serveSSE(
 				}
 				if !headersSent {
 					writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", ev.ErrorMsg)
-					return retryDirective{}
+					return retryDirective{status: "rate_limit_exceeded", httpStatus: http.StatusTooManyRequests, usage: lastUsage, toolCalls: toolCallCount}
 				}
 				writeSSEErrorAndDone("rate_limit_exceeded", "rate_limit_error", ev.ErrorMsg)
-				return retryDirective{}
+				return retryDirective{status: "rate_limit_exceeded", httpStatus: http.StatusTooManyRequests, usage: lastUsage, toolCalls: toolCallCount}
 			case "error":
 				if ev.ErrorCode == "stream_closed" && !headersSent && canRetryStale {
 					return retryDirective{kind: "stale_conn", errMsg: ev.ErrorMsg}
@@ -830,17 +957,17 @@ func (s *Server) serveSSE(
 				if code == "" {
 					code = "upstream_error"
 				}
+				status := http.StatusBadGateway
+				if code == "stream_idle_timeout" {
+					status = http.StatusGatewayTimeout
+				}
 				if !headersSent {
-					status := http.StatusBadGateway
-					if code == "stream_idle_timeout" {
-						status = http.StatusGatewayTimeout
-					}
 					writeOpenAIError(w, status, code, "api_error", ev.ErrorMsg)
-					return retryDirective{}
+					return retryDirective{status: code, httpStatus: status, usage: lastUsage, toolCalls: toolCallCount}
 				}
 				log.Printf("[chat] mid-stream upstream error account=%s code=%s: %s", acct.ID, code, ev.ErrorMsg)
 				writeSSEErrorAndDone(code, "api_error", ev.ErrorMsg)
-				return retryDirective{}
+				return retryDirective{status: code, httpStatus: status, usage: lastUsage, toolCalls: toolCallCount}
 			case "complete":
 				goto finalize
 			}
@@ -858,10 +985,10 @@ finalize:
 	if !emittedOutput && !hitStop {
 		if !headersSent {
 			writeOpenAIError(w, http.StatusBadGateway, "empty_stream", "api_error", "Upstream Quick completed with empty response.")
-			return retryDirective{}
+			return retryDirective{status: "empty_stream", httpStatus: http.StatusBadGateway, usage: lastUsage, toolCalls: toolCallCount}
 		}
 		writeSSEErrorAndDone("empty_stream", "api_error", "Upstream Quick completed with empty response.")
-		return retryDirective{}
+		return retryDirective{status: "empty_stream", httpStatus: http.StatusBadGateway, usage: lastUsage, toolCalls: toolCallCount}
 	}
 
 	if parser.HasToolCalls() && finishReason == "stop" {
@@ -884,7 +1011,7 @@ finalize:
 		flusher.Flush()
 	}
 	s.store.NoteSuccess(acct.ID)
-	return retryDirective{}
+	return retryDirective{status: "ok", httpStatus: http.StatusOK, usage: lastUsage, toolCalls: toolCallCount}
 }
 
 func (s *Server) serveNonStreaming(
@@ -950,14 +1077,14 @@ func (s *Server) serveNonStreaming(
 			}
 		case "guardrail_blocked":
 			writeOpenAIError(w, http.StatusBadRequest, "content_filter", "invalid_request_error", ev.ErrorMsg)
-			return retryDirective{}
+			return retryDirective{status: "content_filter", httpStatus: http.StatusBadRequest, usage: lastUsage, toolCalls: len(toolCalls)}
 		case "usage_blocked", "rate_limited":
 			s.applyQuotaOrRateCooldown(acct, ev.Kind, ev.ErrorMsg)
 			if canRotate {
 				return retryDirective{kind: "rotate_account", errMsg: ev.ErrorMsg}
 			}
 			writeOpenAIError(w, http.StatusTooManyRequests, "rate_limit_exceeded", "rate_limit_error", ev.ErrorMsg)
-			return retryDirective{}
+			return retryDirective{status: "rate_limit_exceeded", httpStatus: http.StatusTooManyRequests, usage: lastUsage, toolCalls: len(toolCalls)}
 		case "error":
 			if ev.ErrorCode == "stream_closed" && canRetryStale && contentBuf.Len() == 0 && reasoningBuf.Len() == 0 && len(toolCalls) == 0 {
 				return retryDirective{kind: "stale_conn", errMsg: ev.ErrorMsg}
@@ -971,7 +1098,7 @@ func (s *Server) serveNonStreaming(
 				status = http.StatusGatewayTimeout
 			}
 			writeOpenAIError(w, status, code, "api_error", ev.ErrorMsg)
-			return retryDirective{}
+			return retryDirective{status: code, httpStatus: status, usage: lastUsage, toolCalls: len(toolCalls)}
 		case "complete":
 			goto done
 		}
@@ -986,7 +1113,7 @@ done:
 
 	if contentBuf.Len() == 0 && reasoningBuf.Len() == 0 && len(toolCalls) == 0 && !hitStop {
 		writeOpenAIError(w, http.StatusBadGateway, "empty_stream", "api_error", "Upstream Quick completed with empty response.")
-		return retryDirective{}
+		return retryDirective{status: "empty_stream", httpStatus: http.StatusBadGateway, usage: lastUsage, toolCalls: len(toolCalls)}
 	}
 
 	if len(toolCalls) > 0 && finishReason == "stop" {
@@ -1027,7 +1154,7 @@ done:
 	}
 	writeJSON(w, http.StatusOK, resp)
 	s.store.NoteSuccess(acct.ID)
-	return retryDirective{}
+	return retryDirective{status: "ok", httpStatus: http.StatusOK, usage: lastUsage, toolCalls: len(toolCalls)}
 }
 func writeJSON(w http.ResponseWriter, status int, v any) {
 	w.Header().Set("Content-Type", "application/json; charset=utf-8")
