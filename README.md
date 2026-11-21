@@ -44,8 +44,12 @@ Each account in `accounts.json` supports an optional `"proxy_url"` (`http://`, `
 - `GET /admin/metrics` & `POST /admin/metrics/reset`
 - `GET /admin/logs` (`?since=&level=&tag=&q=&limit=`) & `POST /admin/logs/clear`
 - `POST /admin/reload`
+- `POST /admin/oauth/start` & `POST /admin/oauth/callback` (remote PKCE OAuth login via pasted localhost callback URL)
+- `POST /admin/accounts/import` (`{"payload", "proxy_url"}`)
 - `POST /admin/accounts/proxy` (`{"id","proxy_url"}`)
 - `POST /admin/accounts/probe-proxy` (`{"id"}`)
+- `POST /admin/accounts/toggle` (`{"id","disabled"}`)
+- `POST /admin/accounts/delete` (`{"id"}`)
 - `POST /admin/accounts/reset-cooldown` (`{"id"}` or `{}`)
 
 ## Models

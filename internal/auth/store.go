@@ -171,25 +171,30 @@ func (s *Store) httpClientForProxy(effectiveProxy string) (*http.Client, error) 
 	return c, nil
 }
 
-// parseAccountsFile reads, normalizes, and strictly validates an accounts JSON file.
-func parseAccountsFile(path string) ([]*Account, error) {
-	data, err := os.ReadFile(path)
-	if err != nil {
-		return nil, fmt.Errorf("read accounts file %s: %w", path, err)
-	}
+// ParseAccountsJSONBytes parses, normalizes, and strictly validates accounts JSON
+// (supports single object, array, or {"accounts":[...]} envelope; allows explicit empty list).
+func ParseAccountsJSONBytes(data []byte) ([]*Account, error) {
 	trimmed := bytes.TrimSpace(data)
 	var list []*Account
+	explicitEmpty := false
 	switch {
 	case len(trimmed) == 0:
-		return nil, errors.New("accounts file is empty")
+		return nil, errors.New("accounts payload is empty")
 	case trimmed[0] == '[':
 		if err := json.Unmarshal(trimmed, &list); err != nil {
 			return nil, fmt.Errorf("parse accounts array: %w", err)
 		}
+		explicitEmpty = len(list) == 0
 	default:
-		var env accountsFileEnvelope
-		if err := json.Unmarshal(trimmed, &env); err == nil && len(env.Accounts) > 0 {
-			list = env.Accounts
+		var rawMap map[string]json.RawMessage
+		if err := json.Unmarshal(trimmed, &rawMap); err != nil {
+			return nil, fmt.Errorf("parse accounts JSON: %w", err)
+		}
+		if rawAccts, hasKey := rawMap["accounts"]; hasKey {
+			if err := json.Unmarshal(rawAccts, &list); err != nil {
+				return nil, fmt.Errorf("parse accounts list: %w", err)
+			}
+			explicitEmpty = len(list) == 0
 		} else {
 			var single Account
 			if err := json.Unmarshal(trimmed, &single); err != nil {
@@ -201,7 +206,10 @@ func parseAccountsFile(path string) ([]*Account, error) {
 		}
 	}
 	if len(list) == 0 {
-		return nil, errors.New("no accounts configured in accounts file")
+		if explicitEmpty {
+			return []*Account{}, nil
+		}
+		return nil, errors.New("no accounts configured in accounts payload")
 	}
 
 	seenIDs := make(map[string]bool, len(list))
@@ -232,10 +240,16 @@ func parseAccountsFile(path string) ([]*Account, error) {
 		}
 		clean = append(clean, a)
 	}
-	if len(clean) == 0 {
-		return nil, errors.New("no valid accounts configured in accounts file")
-	}
 	return clean, nil
+}
+
+// parseAccountsFile reads, normalizes, and strictly validates an accounts JSON file.
+func parseAccountsFile(path string) ([]*Account, error) {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil, fmt.Errorf("read accounts file %s: %w", path, err)
+	}
+	return ParseAccountsJSONBytes(data)
 }
 
 // Load reads accounts from JSON on initial startup.
@@ -350,6 +364,61 @@ func (s *Store) SetAccountProxy(id, proxyURL string) (changed bool, status Accou
 	st := s.statusLocked(target, time.Now())
 	s.mu.Unlock()
 	return oldEff != newEff, st, nil
+}
+
+// SetAccountDisabled toggles an account's disabled flag and atomically persists accounts.json.
+func (s *Store) SetAccountDisabled(id string, disabled bool) (changed bool, status AccountStatus, err error) {
+	s.mu.Lock()
+	var target *Account
+	for _, a := range s.accounts {
+		if a.ID == id {
+			target = a
+			break
+		}
+	}
+	if target == nil {
+		s.mu.Unlock()
+		return false, AccountStatus{}, fmt.Errorf("account %q not found", id)
+	}
+	oldVal := target.Disabled
+	target.Disabled = disabled
+	if oldVal != disabled {
+		if saveErr := s.saveLocked(); saveErr != nil {
+			target.Disabled = oldVal
+			s.mu.Unlock()
+			return false, AccountStatus{}, fmt.Errorf("persist account state: %w", saveErr)
+		}
+	}
+	st := s.statusLocked(target, time.Now())
+	s.mu.Unlock()
+	return oldVal != disabled, st, nil
+}
+
+// DeleteAccount removes an account from the pool and atomically persists accounts.json.
+func (s *Store) DeleteAccount(id string) (bool, error) {
+	s.mu.Lock()
+	idx := -1
+	for i, a := range s.accounts {
+		if a.ID == id {
+			idx = i
+			break
+		}
+	}
+	if idx < 0 {
+		s.mu.Unlock()
+		return false, fmt.Errorf("account %q not found", id)
+	}
+	oldSlice := make([]*Account, len(s.accounts))
+	copy(oldSlice, s.accounts)
+	s.accounts = append(s.accounts[:idx], s.accounts[idx+1:]...)
+	if saveErr := s.saveLocked(); saveErr != nil {
+		s.accounts = oldSlice
+		s.mu.Unlock()
+		return false, fmt.Errorf("persist account deletion: %w", saveErr)
+	}
+	delete(s.runtime, id)
+	s.mu.Unlock()
+	return true, nil
 }
 
 // GetAccount returns a copy of a specific account by ID.

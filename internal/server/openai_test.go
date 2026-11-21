@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"net/url"
 	"os"
 	"path/filepath"
 	"strings"
@@ -564,5 +565,150 @@ func TestAdminPasswordLoginSessionCSRFAndRateLimit(t *testing.T) {
 	}
 	if w := badLogin("root", "TestStrongPass!99", "203.0.113.99"); w.Code != http.StatusTooManyRequests {
 		t.Fatalf("expected 429 after brute-force lockout, got %d", w.Code)
+	}
+}
+
+func TestAdminWebOAuthFlowAndAccountManagement(t *testing.T) {
+	srv := newTestServer(t)
+	srv.cfg.APIKeys = []string{"admin-secret"}
+
+	// Mock AWS sso-oidc endpoints (/client/register and /token).
+	var gotVerifier string
+	var gotRedirect string
+	oidcMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/client/register":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clientId":              "mock-client-id",
+				"clientSecret":          "mock-client-secret",
+				"clientSecretExpiresAt": time.Now().Add(24 * time.Hour).Unix(),
+			})
+		case "/token":
+			var body map[string]any
+			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+				w.WriteHeader(http.StatusBadRequest)
+				return
+			}
+			if body["clientId"] != "mock-client-id" || body["clientSecret"] != "mock-client-secret" || body["code"] != "auth-code-xyz" {
+				w.WriteHeader(http.StatusBadRequest)
+				_, _ = w.Write([]byte(`{"error":"invalid_grant"}`))
+				return
+			}
+			gotVerifier, _ = body["codeVerifier"].(string)
+			gotRedirect, _ = body["redirectUri"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"accessToken":  "aoa_mock_access",
+				"refreshToken": "aor_mock_refresh",
+				"expiresIn":    3600,
+				"tokenType":    "Bearer",
+			})
+		default:
+			w.WriteHeader(http.StatusNotFound)
+		}
+	}))
+	defer oidcMock.Close()
+	srv.oauthBaseURL = oidcMock.URL
+
+	postJSON := func(path, body string) *httptest.ResponseRecorder {
+		req := httptest.NewRequest(http.MethodPost, path, strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer admin-secret")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		return w
+	}
+
+	// 1. Validation checks on /admin/oauth/start.
+	if w := postJSON("/admin/oauth/start", `{"proxy_url":"ftp://bad:21"}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid proxy_url, got %d: %s", w.Code, w.Body.String())
+	}
+	if w := postJSON("/admin/oauth/start", `{"callback_port":80}`); w.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on invalid callback_port, got %d: %s", w.Code, w.Body.String())
+	}
+
+	// 2. Start OAuth flow (uses fast-fail local tenant_url so best-effort usage probe finishes immediately).
+	wStart := postJSON("/admin/oauth/start", `{"id":"web-oauth-1","tenant_url":"https://127.0.0.1:1","proxy_url":"direct","callback_port":19090}`)
+	if wStart.Code != http.StatusOK {
+		t.Fatalf("oauth/start failed: %d %s", wStart.Code, wStart.Body.String())
+	}
+	var startResp struct {
+		State       string `json:"state"`
+		AuthURL     string `json:"auth_url"`
+		RedirectURI string `json:"redirect_uri"`
+	}
+	if err := json.Unmarshal(wStart.Body.Bytes(), &startResp); err != nil {
+		t.Fatal(err)
+	}
+	if startResp.State == "" || startResp.RedirectURI != "http://127.0.0.1:19090/oauth/callback" {
+		t.Fatalf("unexpected startResp: %+v", startResp)
+	}
+	parsedAuth, err := url.Parse(startResp.AuthURL)
+	if err != nil || parsedAuth.Query().Get("state") != startResp.State || parsedAuth.Query().Get("code_challenge") == "" {
+		t.Fatalf("invalid auth_url: %q", startResp.AuthURL)
+	}
+
+	// 3. State mismatch and upstream callback error are rejected without consuming the session.
+	wMismatch := postJSON("/admin/oauth/callback", `{"state":"`+startResp.State+`","redirect_url":"http://127.0.0.1:19090/oauth/callback?code=auth-code-xyz&state=wrongstate"}`)
+	if wMismatch.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on state mismatch, got %d", wMismatch.Code)
+	}
+	wOAuthErr := postJSON("/admin/oauth/callback", `{"state":"`+startResp.State+`","redirect_url":"http://127.0.0.1:19090/oauth/callback?error=access_denied&error_description=user_cancelled"}`)
+	if wOAuthErr.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on oauth error param, got %d", wOAuthErr.Code)
+	}
+
+	// 4. Valid CPA-style pasted callback URL completes token exchange, persists, and hot-reloads.
+	cbURL := "http://127.0.0.1:19090/oauth/callback?code=auth-code-xyz&state=" + startResp.State
+	wCB := postJSON("/admin/oauth/callback", `{"redirect_url":"`+cbURL+`"}`)
+	if wCB.Code != http.StatusOK {
+		t.Fatalf("oauth/callback failed: %d %s", wCB.Code, wCB.Body.String())
+	}
+	if gotVerifier == "" || gotRedirect != "http://127.0.0.1:19090/oauth/callback" {
+		t.Fatalf("unexpected token exchange params: verifier=%q redirect=%q", gotVerifier, gotRedirect)
+	}
+	acct, ok := srv.store.GetAccount("web-oauth-1")
+	if !ok || acct.AccessToken != "aoa_mock_access" || acct.RefreshToken != "aor_mock_refresh" || acct.ProxyURL != "direct" {
+		t.Fatalf("expected persisted oauth account, got ok=%v acct=%+v", ok, acct)
+	}
+
+	// 5. Replaying consumed state fails with 404.
+	if wReplay := postJSON("/admin/oauth/callback", `{"redirect_url":"`+cbURL+`"}`); wReplay.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 on callback replay, got %d", wReplay.Code)
+	}
+
+	// 6. Manual JSON import adds account with proxy override and rejects missing tokens.
+	wBadImp := postJSON("/admin/accounts/import", `{"payload":{"id":"no-tok","tenant_url":"https://127.0.0.1:1"}}`)
+	if wBadImp.Code != http.StatusBadRequest {
+		t.Fatalf("expected 400 on import missing tokens, got %d", wBadImp.Code)
+	}
+	wImp := postJSON("/admin/accounts/import", `{"payload":{"id":"imp-1","tenant_url":"https://127.0.0.1:1","access_token":"at_imp","access_token_expiry":2000000000},"proxy_url":"socks5h://127.0.0.1:1080"}`)
+	if wImp.Code != http.StatusOK {
+		t.Fatalf("accounts/import failed: %d %s", wImp.Code, wImp.Body.String())
+	}
+	if impAcct, ok := srv.store.GetAccount("imp-1"); !ok || impAcct.ProxyURL != "socks5h://127.0.0.1:1080" {
+		t.Fatalf("expected imported account with proxy override, got ok=%v acct=%+v", ok, impAcct)
+	}
+
+	// 7. Toggle disable/enable and delete via admin API.
+	if wTog := postJSON("/admin/accounts/toggle", `{"id":"imp-1","disabled":true}`); wTog.Code != http.StatusOK {
+		t.Fatalf("toggle disable failed: %d %s", wTog.Code, wTog.Body.String())
+	}
+	if impAcct, _ := srv.store.GetAccount("imp-1"); !impAcct.Disabled {
+		t.Fatalf("expected imp-1 to be disabled")
+	}
+	if wDel := postJSON("/admin/accounts/delete", `{"id":"imp-1"}`); wDel.Code != http.StatusOK {
+		t.Fatalf("delete failed: %d %s", wDel.Code, wDel.Body.String())
+	}
+	if _, ok := srv.store.GetAccount("imp-1"); ok {
+		t.Fatalf("expected imp-1 removed from store")
+	}
+	if wDel404 := postJSON("/admin/accounts/delete", `{"id":"imp-1"}`); wDel404.Code != http.StatusNotFound {
+		t.Fatalf("expected 404 deleting missing account, got %d", wDel404.Code)
 	}
 }

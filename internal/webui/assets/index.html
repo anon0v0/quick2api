@@ -188,6 +188,7 @@
             <p class="section-desc">查看配额消耗、冷却倒计时、出口代理并执行热重载</p>
           </div>
           <div class="action-row">
+            <button type="button" id="btn-open-oauth" class="btn btn-primary">+ OAuth 登录</button>
             <button type="button" id="btn-fetch-usage" class="btn btn-secondary">拉取实时配额</button>
             <button type="button" id="btn-reload-accounts" class="btn btn-secondary">热重载账号</button>
             <button type="button" id="btn-reset-all-cd" class="btn btn-ghost">清除全部冷却</button>
@@ -349,6 +350,119 @@
         <div class="modal-foot">
           <button type="button" id="proxy-cancel" class="btn btn-ghost">取消</button>
           <button type="submit" id="proxy-save" class="btn btn-primary">保存并生效</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- OAuth Login & Account Import Modal -->
+  <div id="oauth-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true" aria-labelledby="oauth-modal-title">
+    <div class="modal-card modal-wide">
+      <div class="modal-head">
+        <div class="modal-head-group">
+          <h3 id="oauth-modal-title" class="panel-title">添加 Amazon Quick 账号</h3>
+          <div class="seg-group" id="add-acct-tabs" role="tablist">
+            <button type="button" class="seg-btn active" data-add-mode="oauth">OAuth 回调登录</button>
+            <button type="button" class="seg-btn" data-add-mode="import">导入 JSON</button>
+          </div>
+        </div>
+        <button type="button" id="oauth-modal-close" class="btn btn-ghost btn-icon" aria-label="关闭">✕</button>
+      </div>
+
+      <!-- Mode A: Remote OAuth Callback Login (CPA-style) -->
+      <div id="add-pane-oauth" class="modal-body">
+        <form id="oauth-start-form" class="auth-form" autocomplete="off">
+          <div>
+            <label class="field-label" for="oauth-tenant-input">租户地址（tenant_url）</label>
+            <input id="oauth-tenant-input" type="url" class="input mono" placeholder="https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev" required />
+            <p class="field-hint" style="margin-top:4px">若账号池已有账号会自动填入当前单元地址；不同账号归属不同单元时可按需修改。</p>
+          </div>
+          <div class="form-grid-2">
+            <div>
+              <label class="field-label" for="oauth-id-input">账号 ID（可选）</label>
+              <input id="oauth-id-input" type="text" class="input mono" placeholder="留空自动生成 social-..." />
+            </div>
+            <div>
+              <label class="field-label" for="oauth-proxy-input">出口代理（可选）</label>
+              <input id="oauth-proxy-input" type="text" class="input mono" placeholder="socks5://host:port 或 direct" />
+            </div>
+          </div>
+          <div class="preset-row">
+            <button type="button" class="chip-btn" data-oauth-proxy="">代理：继承全局</button>
+            <button type="button" class="chip-btn" data-oauth-proxy="direct">代理：强制直连</button>
+          </div>
+          <details class="adv-details">
+            <summary>高级 OIDC 参数（区域 / 回调端口 / Scopes / Issuer）</summary>
+            <div class="adv-body">
+              <div class="form-grid-2">
+                <div>
+                  <label class="field-label" for="oauth-region-input">区域（region）</label>
+                  <input id="oauth-region-input" type="text" class="input mono" value="us-east-1" />
+                </div>
+                <div>
+                  <label class="field-label" for="oauth-port-input">回调端口（127.0.0.1）</label>
+                  <input id="oauth-port-input" type="number" class="input mono" value="18080" min="1024" max="65535" />
+                </div>
+              </div>
+              <div>
+                <label class="field-label" for="oauth-scopes-input">Scopes（逗号分隔）</label>
+                <input id="oauth-scopes-input" type="text" class="input mono" value="sso:account:access" />
+              </div>
+              <div>
+                <label class="field-label" for="oauth-issuer-input">Issuer URL</label>
+                <input id="oauth-issuer-input" type="url" class="input mono" value="https://identitycenter.amazonaws.com/ssoins-72233407e73f5d00" />
+              </div>
+            </div>
+          </details>
+          <div class="modal-foot" style="justify-content:space-between;align-items:center">
+            <span class="field-hint">注册与换取 Token 均经上述代理出站</span>
+            <button type="submit" id="oauth-start-btn" class="btn btn-primary">生成登录链接</button>
+          </div>
+        </form>
+
+        <div id="oauth-step2" class="oauth-step-box hidden">
+          <div class="oauth-step-head">
+            <span class="step-badge">步骤 1</span>
+            <span class="strong-text">在本地浏览器打开授权链接完成登录</span>
+            <span id="oauth-ttl-hint" class="meta-text mono" style="margin-left:auto">有效期 10 分钟</span>
+          </div>
+          <div class="oauth-url-row">
+            <input id="oauth-auth-url" type="text" class="input mono" readonly />
+            <a id="oauth-open-link" href="#" target="_blank" rel="noopener noreferrer" class="btn btn-primary btn-sm">打开登录页</a>
+            <button type="button" id="oauth-copy-url" class="btn btn-secondary btn-sm">复制</button>
+          </div>
+
+          <div class="oauth-step-head" style="margin-top:8px">
+            <span class="step-badge">步骤 2</span>
+            <span class="strong-text">粘贴浏览器跳转后的完整回调 URL</span>
+          </div>
+          <p class="field-hint">远程部署时浏览器会跳转到无法访问的 <code class="mono" id="oauth-redir-preview">http://127.0.0.1:18080/oauth/callback</code>，直接复制地址栏完整 URL（含 <code class="mono">code=</code> 与 <code class="mono">state=</code>）粘贴到下方提交即可。</p>
+          <form id="oauth-callback-form" class="auth-form" autocomplete="off">
+            <textarea id="oauth-callback-input" class="input textarea mono" rows="3" placeholder="http://127.0.0.1:18080/oauth/callback?code=...&state=..." required></textarea>
+            <div class="modal-foot">
+              <button type="button" id="oauth-reset-flow" class="btn btn-ghost">重新生成</button>
+              <button type="submit" id="oauth-callback-submit" class="btn btn-primary">提交回调并完成登录</button>
+            </div>
+          </form>
+        </div>
+
+        <div id="oauth-error" class="form-error hidden" role="alert"></div>
+        <div id="oauth-ok" class="form-ok hidden" role="status"></div>
+      </div>
+
+      <!-- Mode B: Manual JSON Import -->
+      <form id="import-json-form" class="modal-body hidden" autocomplete="off">
+        <p class="field-hint">支持粘贴单账号 JSON 对象、账号数组或 <code class="mono">quick2api import-desktop</code> 导出的 <code class="mono">accounts.json</code> 内容，导入后自动落盘（0600）并热重载。</p>
+        <label class="field-label" for="import-json-input">账号 JSON</label>
+        <textarea id="import-json-input" class="input textarea mono" rows="7" placeholder='{"id":"social-xxx","tenant_url":"https://...","client_id":"...","client_secret":"...","access_token":"...","refresh_token":"..."}' required></textarea>
+        <div>
+          <label class="field-label" for="import-proxy-input">统一覆盖出口代理（可选，留空保留 JSON 内原配置）</label>
+          <input id="import-proxy-input" type="text" class="input mono" placeholder="socks5://user:pass@host:port 或 direct" />
+        </div>
+        <div id="import-error" class="form-error hidden" role="alert"></div>
+        <div class="modal-foot">
+          <button type="button" id="import-cancel" class="btn btn-ghost">取消</button>
+          <button type="submit" id="import-submit" class="btn btn-primary">导入并热重载</button>
         </div>
       </form>
     </div>

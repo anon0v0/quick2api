@@ -322,3 +322,69 @@ func TestStoreHotReloadPreservesStateAndUpsert(t *testing.T) {
 		t.Fatalf("expected UpsertAccountsFile to preserve proxy_url and update token, got %+v", k2)
 	}
 }
+
+func TestParseAccountsEmptyAndToggleDelete(t *testing.T) {
+	// Explicit empty list forms succeed; empty object without accounts key fails.
+	if list, err := ParseAccountsJSONBytes([]byte(`{"accounts":[]}`)); err != nil || len(list) != 0 {
+		t.Fatalf("expected empty envelope to succeed, got len=%d err=%v", len(list), err)
+	}
+	if list, err := ParseAccountsJSONBytes([]byte(`[]`)); err != nil || len(list) != 0 {
+		t.Fatalf("expected empty array to succeed, got len=%d err=%v", len(list), err)
+	}
+	if _, err := ParseAccountsJSONBytes([]byte(`{}`)); err == nil {
+		t.Fatalf("expected bare empty object to fail")
+	}
+
+	dir := t.TempDir()
+	accPath := filepath.Join(dir, "accounts.json")
+	raw := `{"accounts":[
+		{"id":"a1","tenant_url":"https://c1.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev","access_token":"t1","access_token_expiry":2000000000},
+		{"id":"a2","tenant_url":"https://c2.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev","access_token":"t2","access_token_expiry":2000000000}
+	]}`
+	if err := os.WriteFile(accPath, []byte(raw), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := NewStore(accPath, 5*time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// Toggle disable -> persists and lowers AccountCount.
+	changed, st, err := store.SetAccountDisabled("a1", true)
+	if err != nil || !changed || !st.Disabled {
+		t.Fatalf("expected a1 disabled, changed=%v st=%+v err=%v", changed, st, err)
+	}
+	if store.AccountCount() != 1 {
+		t.Fatalf("expected 1 enabled account, got %d", store.AccountCount())
+	}
+	// Idempotent second call reports changed=false.
+	if changed2, _, err := store.SetAccountDisabled("a1", true); err != nil || changed2 {
+		t.Fatalf("expected idempotent disable, changed=%v err=%v", changed2, err)
+	}
+	// Not found returns error.
+	if _, _, err := store.SetAccountDisabled("missing", true); err == nil {
+		t.Fatalf("expected not found error")
+	}
+	// Re-enable persists across fresh store reload.
+	if changed, st, err = store.SetAccountDisabled("a1", false); err != nil || !changed || st.Disabled {
+		t.Fatalf("expected a1 re-enabled, changed=%v st=%+v err=%v", changed, st, err)
+	}
+
+	// Delete a1, then delete last remaining account a2 -> file stays valid empty envelope.
+	if ok, err := store.DeleteAccount("a1"); err != nil || !ok {
+		t.Fatalf("delete a1 failed: ok=%v err=%v", ok, err)
+	}
+	if _, err := store.DeleteAccount("a1"); err == nil {
+		t.Fatalf("expected second delete of a1 to fail")
+	}
+	if ok, err := store.DeleteAccount("a2"); err != nil || !ok {
+		t.Fatalf("delete last account a2 failed: ok=%v err=%v", ok, err)
+	}
+	reloaded, err := NewStore(accPath, 5*time.Minute, "")
+	if err != nil {
+		t.Fatalf("reloading empty accounts.json failed: %v", err)
+	}
+	if len(reloaded.Statuses()) != 0 {
+		t.Fatalf("expected 0 accounts after reload, got %d", len(reloaded.Statuses()))
+	}
+}

@@ -22,6 +22,8 @@
     probeResults: {},
     statusFetchedAt: 0,
     proxyModalAcctId: "",
+    oauthSession: null,
+    oauthMode: "oauth",
   };
 
   let pollTimer = null;
@@ -107,6 +109,36 @@
     }
   }
 
+  function formatSubscription(q) {
+    if (!q) return { label: "", raw: "" };
+    const rawParts = [q.subscription_type, q.trial_status].filter(Boolean);
+    const raw = rawParts.join(" · ");
+    if (!raw) return { label: "", raw: "" };
+
+    let plan = (q.subscription_type || "").trim();
+    if (plan) {
+      const clean = plan
+        .replace(/^QUICK_/i, "")
+        .replace(/_FREE$/i, "")
+        .replace(/_TRIAL$/i, "")
+        .replace(/_/g, " ")
+        .trim();
+      plan = clean
+        ? clean.toLowerCase().replace(/\b\w/g, (c) => c.toUpperCase())
+        : plan;
+    }
+
+    let trial = (q.trial_status || "").trim().toUpperCase();
+    let trialLabel = "";
+    if (trial === "ACTIVE") trialLabel = "试用中";
+    else if (trial === "EXPIRED") trialLabel = "试用已过期";
+    else if (trial === "ELIGIBLE") trialLabel = "可试用";
+    else if (trial && trial !== "NONE" && trial !== "INACTIVE") trialLabel = trial;
+
+    const label = [plan, trialLabel].filter(Boolean).join(" · ") || raw;
+    return { label, raw };
+  }
+
   function toast(msg, isError = false) {
     const root = $("toast-root");
     const el = document.createElement("div");
@@ -161,7 +193,9 @@
       if (!options.noAuthGate) {
         showAuthGate(wasAuthed && !options.suppressAuthError ? "登录会话已过期，请重新登录。" : "");
       }
-      throw new Error((data && data.error && data.error.message) || "unauthorized");
+      const authErr = new Error((data && data.error && data.error.message) || "unauthorized");
+      authErr.unauthorized = true;
+      throw authErr;
     }
     if (!resp.ok) {
       const msg = (data && data.error && data.error.message) || `HTTP ${resp.status}`;
@@ -205,7 +239,7 @@
       renderAll();
       $("last-sync-text").textContent = "同步于 " + fmtClock(Math.floor(Date.now() / 1000));
     } catch (err) {
-      if (err.message !== "unauthorized") {
+      if (!err.unauthorized) {
         setHealthPill("err", "连接异常");
         toast("获取状态失败: " + err.message, true);
       }
@@ -232,7 +266,7 @@
       state.logTags = data.tags || [];
       renderLogs();
     } catch (err) {
-      if (err.message !== "unauthorized") {
+      if (!err.unauthorized) {
         // silent on background poll
       }
     }
@@ -523,8 +557,16 @@
   function renderAccountsTab() {
     const grid = $("accounts-grid");
     const accts = (state.status && state.status.accounts) || [];
+    grid.classList.toggle("single-card", accts.length === 1);
     if (accts.length === 0) {
-      grid.innerHTML = '<div class="panel"><div class="empty-state">暂无账号，请使用 quick2api login / import-desktop 添加后点击「热重载账号」。</div></div>';
+      grid.innerHTML = `
+        <div class="panel">
+          <div class="empty-state">
+            <div style="margin-bottom:10px">暂无账号，点击右上角「+ OAuth 登录」即可通过远程回调 URL 添加 Amazon Quick 账号。</div>
+            <button type="button" class="btn btn-primary btn-sm" data-act="open-oauth">+ OAuth 登录</button>
+          </div>
+        </div>
+      `;
       return;
     }
     const usageByAcct = {};
@@ -537,68 +579,112 @@
       const q = a.quota;
       const u = usageByAcct[a.id];
       const probe = state.probeResults[a.id];
+      const sub = formatSubscription(q);
 
       const monthlyPct = q ? Math.min(100, Math.max(0, q.monthly_percent || (q.monthly_limit > 0 ? Math.round((q.monthly_used / q.monthly_limit) * 100) : 0))) : 0;
       const sessionPct = q ? Math.min(100, Math.max(0, q.session_percent || (q.session_limit > 0 ? Math.round((q.session_used / q.session_limit) * 100) : 0))) : 0;
+      const monthlyHasVal = q && q.monthly_used > 0;
+      const sessionHasVal = q && q.session_used > 0;
 
       const quotaHTML = q ? `
         <div class="quota-grid">
           <div class="quota-box">
             <div class="quota-row">
               <span class="quota-label">月度配额</span>
-              <span class="quota-val">${fmtNum(q.monthly_used)} / ${fmtNum(q.monthly_limit)}</span>
+              <span class="quota-val">${fmtNum(q.monthly_used)}<span class="quota-limit"> / ${fmtNum(q.monthly_limit)}</span></span>
             </div>
-            <div class="progress-track"><div class="progress-fill ${quotaFillClass(monthlyPct)}" style="width:${monthlyPct}%"></div></div>
-            <div class="quota-foot">${monthlyPct}%${q.monthly_resets_at ? " · 重置 " + fmtDateTime(q.monthly_resets_at) : ""}</div>
+            <div class="progress-track">
+              <div class="progress-fill ${quotaFillClass(monthlyPct)}${monthlyHasVal ? " has-val" : ""}" style="width:${monthlyPct}%"></div>
+            </div>
+            <div class="quota-foot">
+              <span class="mono">${monthlyPct}%</span>
+              <span>${q.monthly_resets_at ? "重置 " + fmtDateTime(q.monthly_resets_at) : "本月已用"}</span>
+            </div>
           </div>
           <div class="quota-box">
             <div class="quota-row">
               <span class="quota-label">会话配额</span>
-              <span class="quota-val">${fmtNum(q.session_used)} / ${fmtNum(q.session_limit)}</span>
+              <span class="quota-val">${fmtNum(q.session_used)}<span class="quota-limit"> / ${fmtNum(q.session_limit)}</span></span>
             </div>
-            <div class="progress-track"><div class="progress-fill ${quotaFillClass(sessionPct)}" style="width:${sessionPct}%"></div></div>
-            <div class="quota-foot">${sessionPct}%${q.session_resume_in_minutes ? ` · ${q.session_resume_in_minutes}m 后恢复` : (q.session_resets_at ? " · 重置 " + fmtClock(q.session_resets_at) : "")}</div>
+            <div class="progress-track">
+              <div class="progress-fill ${quotaFillClass(sessionPct)}${sessionHasVal ? " has-val" : ""}" style="width:${sessionPct}%"></div>
+            </div>
+            <div class="quota-foot">
+              <span class="mono">${sessionPct}%</span>
+              <span>${q.session_resume_in_minutes ? `${q.session_resume_in_minutes}m 后恢复` : (q.session_resets_at ? "重置 " + fmtClock(q.session_resets_at) : "当前窗口")}</span>
+            </div>
           </div>
         </div>
-      ` : '<div class="meta-text">尚未拉取配额快照，点击上方「拉取实时配额」可立即查询。</div>';
-
-      const tokenTTL = a.access_expires_in_sec > 0 ? fmtDuration(a.access_expires_in_sec) : "已过期（待刷新）";
-      const subText = q && (q.subscription_type || q.trial_status)
-        ? [q.subscription_type, q.trial_status].filter(Boolean).join(" · ")
-        : "--";
-      const reqSummary = u ? `${fmtNum(u.requests)} 次（${fmtCompact(u.total_tokens)}）` : "0 次";
-
-      const probeHTML = probe ? `
-        <div class="probe-result">
-          <span>${probe.ok ? `出口 IP: ${esc(probe.ip)}` : `探测失败: ${esc(probe.error)}`}</span>
-          <span>${probe.ok ? `${probe.latency}ms` : ""}</span>
+      ` : `
+        <div class="quota-empty">
+          <span>尚未拉取配额快照</span>
+          <button type="button" class="link-btn" data-act="fetch-usage">立即拉取 →</button>
         </div>
-      ` : "";
+      `;
+
+      const tokenExpired = !(a.access_expires_in_sec > 0);
+      const tokenTTL = tokenExpired ? "待自动刷新" : fmtDuration(a.access_expires_in_sec);
+      const refreshHint = a.has_refresh_token ? "含 Refresh Token" : "无 Refresh Token";
+      const reqMain = u ? `${fmtNum(u.requests)} 次` : "0 次";
+      const reqSub = u
+        ? (u.total_tokens > 0 ? `${fmtCompact(u.total_tokens)} tok` : (u.errors > 0 ? `异常 ${u.errors}` : "本轮无 Token"))
+        : "服务启动至今";
+      const proxyDisplay = a.proxy || "直连（未配置代理）";
+
+      const probeBadge = probe
+        ? `<span class="acct-probe-pill ${probe.ok ? "ok" : "err"}" title="${esc(probe.ok ? `出口 IP ${probe.ip}` : probe.error)}">${probe.ok ? `${esc(probe.ip)} · ${probe.latency}ms` : "探测失败"}</span>`
+        : "";
 
       return `
-        <article class="acct-card">
+        <article class="acct-card${a.disabled ? " is-disabled" : ""}">
           <div class="acct-head">
-            <div style="min-width:0">
-              <div class="acct-title">${esc(a.id)}</div>
+            <div class="acct-head-main">
+              <div class="acct-title-row">
+                <span class="acct-title">${esc(a.id)}</span>
+                ${sub.label ? `<span class="acct-sub-badge" title="${esc(sub.raw)}">${esc(sub.label)}</span>` : ""}
+              </div>
               <div class="acct-sub mono" title="${esc(a.tenant_host || "")}">${esc(a.tenant_host || "-")}</div>
             </div>
             <span class="status-pill ${badge.cls}" data-cd-acct="${esc(a.id)}"><span class="dot"></span>${esc(badge.text)}</span>
           </div>
           <div class="acct-body">
             ${quotaHTML}
-            <div class="spec-grid">
-              <div class="spec-item"><span class="spec-k">出口代理</span><span class="spec-v" title="${esc(a.proxy || "直连")}">${esc(a.proxy || "直连")}</span></div>
-              <div class="spec-item"><span class="spec-k">区域 / 订阅</span><span class="spec-v">${esc(a.region || "us-east-1")} · ${esc(subText)}</span></div>
-              <div class="spec-item"><span class="spec-k">Access Token 剩余</span><span class="spec-v">${esc(tokenTTL)}</span></div>
-              <div class="spec-item"><span class="spec-k">本轮请求 / Token</span><span class="spec-v">${esc(reqSummary)}</span></div>
+            <div class="acct-proxy-bar">
+              <div class="acct-proxy-main">
+                <span class="acct-proxy-label">出口代理</span>
+                <span class="acct-proxy-val" title="${esc(proxyDisplay)}">${esc(proxyDisplay)}</span>
+              </div>
+              ${probeBadge}
+            </div>
+            <div class="acct-stats-row">
+              <div class="acct-stat">
+                <span class="acct-stat-k">区域</span>
+                <span class="acct-stat-v">${esc(a.region || "us-east-1")}</span>
+                <span class="acct-stat-sub">${q && q.updated_at ? `配额同步 ${esc(fmtClock(q.updated_at))}` : "未拉取配额"}</span>
+              </div>
+              <div class="acct-stat">
+                <span class="acct-stat-k">Access Token</span>
+                <span class="acct-stat-v${tokenExpired ? " is-warn" : ""}">${esc(tokenTTL)}</span>
+                <span class="acct-stat-sub">${esc(refreshHint)}</span>
+              </div>
+              <div class="acct-stat">
+                <span class="acct-stat-k">本轮请求</span>
+                <span class="acct-stat-v">${esc(reqMain)}</span>
+                <span class="acct-stat-sub">${esc(reqSub)}</span>
+              </div>
             </div>
             ${a.last_error ? `<div class="acct-error">${esc(a.last_error)}</div>` : ""}
-            ${probeHTML}
           </div>
           <div class="acct-foot">
-            <button type="button" class="btn btn-secondary btn-sm" data-act="proxy" data-id="${esc(a.id)}">设置代理</button>
-            <button type="button" class="btn btn-secondary btn-sm" data-act="probe" data-id="${esc(a.id)}">探测出口</button>
-            <button type="button" class="btn btn-ghost btn-sm" data-act="reset-cd" data-id="${esc(a.id)}" ${badge.cd > 0 || a.last_error ? "" : "disabled"}>清除冷却</button>
+            <div class="acct-foot-group">
+              <button type="button" class="btn btn-secondary btn-sm" data-act="proxy" data-id="${esc(a.id)}">设置代理</button>
+              <button type="button" class="btn btn-secondary btn-sm" data-act="probe" data-id="${esc(a.id)}">探测出口</button>
+              <button type="button" class="btn btn-ghost btn-sm" data-act="reset-cd" data-id="${esc(a.id)}" ${badge.cd > 0 || a.last_error ? "" : "disabled"}>清除冷却</button>
+            </div>
+            <div class="acct-foot-group">
+              <button type="button" class="btn btn-ghost btn-sm" data-act="toggle" data-id="${esc(a.id)}" data-disabled="${a.disabled ? "1" : "0"}">${a.disabled ? "启用" : "禁用"}</button>
+              <button type="button" class="btn btn-danger-ghost btn-sm" data-act="delete" data-id="${esc(a.id)}">删除</button>
+            </div>
           </div>
         </article>
       `;
@@ -815,7 +901,7 @@
       state.probeResults[acctId] = { ok: true, ip: res.egress_ip, latency: res.latency_ms };
       toast(`${acctId} 出口正常: ${res.egress_ip} (${res.latency_ms}ms)`);
     } catch (err) {
-      if (err.message !== "unauthorized") {
+      if (!err.unauthorized) {
         state.probeResults[acctId] = { ok: false, error: err.message };
         toast(`出口探测失败: ${err.message}`, true);
       }
@@ -833,7 +919,93 @@
       toast(acctId ? `已清除 ${acctId} 冷却状态` : `已清除 ${res.cleared || 0} 个账号的冷却状态`);
       await fetchCore(false);
     } catch (err) {
-      if (err.message !== "unauthorized") toast("清除冷却失败: " + err.message, true);
+      if (!err.unauthorized) toast("清除冷却失败: " + err.message, true);
+    }
+  }
+
+  async function toggleAccountDisabled(acctId, nextDisabled) {
+    try {
+      await apiFetch("/admin/accounts/toggle", {
+        method: "POST",
+        body: { id: acctId, disabled: nextDisabled },
+      });
+      toast(nextDisabled ? `已禁用账号 ${acctId}` : `已启用账号 ${acctId}`);
+      await fetchCore(false);
+    } catch (err) {
+      if (!err.unauthorized) toast("切换账号状态失败: " + err.message, true);
+    }
+  }
+
+  async function deleteAccount(acctId) {
+    if (!window.confirm(`确认永久删除账号 ${acctId}？\n该操作会立即从 accounts.json 移除凭证并断开其连接。`)) return;
+    try {
+      await apiFetch("/admin/accounts/delete", {
+        method: "POST",
+        body: { id: acctId },
+      });
+      delete state.probeResults[acctId];
+      toast(`已删除账号 ${acctId}`);
+      await fetchCore(false);
+    } catch (err) {
+      if (!err.unauthorized) toast("删除账号失败: " + err.message, true);
+    }
+  }
+
+  function switchAddAccountMode(mode) {
+    state.oauthMode = mode === "import" ? "import" : "oauth";
+    $("add-acct-tabs").querySelectorAll(".seg-btn").forEach((b) => {
+      b.classList.toggle("active", b.getAttribute("data-add-mode") === state.oauthMode);
+    });
+    $("add-pane-oauth").classList.toggle("hidden", state.oauthMode !== "oauth");
+    $("import-json-form").classList.toggle("hidden", state.oauthMode !== "import");
+  }
+
+  function resetOAuthFlow() {
+    state.oauthSession = null;
+    $("oauth-step2").classList.add("hidden");
+    $("oauth-auth-url").value = "";
+    $("oauth-open-link").setAttribute("href", "#");
+    $("oauth-callback-input").value = "";
+    $("oauth-error").classList.add("hidden");
+    $("oauth-ok").classList.add("hidden");
+    $("oauth-start-btn").textContent = "生成登录链接";
+  }
+
+  function openOAuthModal(mode = "oauth") {
+    resetOAuthFlow();
+    $("import-error").classList.add("hidden");
+    $("import-json-input").value = "";
+    $("import-proxy-input").value = "";
+    // Pre-fill tenant_url from existing account pool if input is empty
+    const tenantInput = $("oauth-tenant-input");
+    if (!tenantInput.value.trim()) {
+      const firstWithHost = ((state.status && state.status.accounts) || []).find((a) => a.tenant_host);
+      if (firstWithHost) {
+        tenantInput.value = "https://" + firstWithHost.tenant_host;
+      }
+    }
+    switchAddAccountMode(mode);
+    $("oauth-modal").classList.remove("hidden");
+    if (mode === "import") {
+      $("import-json-input").focus();
+    } else if (!tenantInput.value.trim()) {
+      tenantInput.focus();
+    } else {
+      $("oauth-id-input").focus();
+    }
+  }
+
+  function closeOAuthModal() {
+    $("oauth-modal").classList.add("hidden");
+  }
+
+  async function copyToClipboard(text, successMsg) {
+    if (!text) return;
+    try {
+      await navigator.clipboard.writeText(text);
+      toast(successMsg || "已复制到剪贴板");
+    } catch (_) {
+      toast("剪贴板不可用，请手动复制", true);
     }
   }
 
@@ -948,6 +1120,8 @@
     });
 
     // Accounts tab global actions
+    $("btn-open-oauth").addEventListener("click", () => openOAuthModal("oauth"));
+
     $("btn-fetch-usage").addEventListener("click", async () => {
       const btn = $("btn-fetch-usage");
       btn.disabled = true;
@@ -971,7 +1145,7 @@
         await fetchCore(false);
         await fetchLogs(false);
       } catch (err) {
-        if (err.message !== "unauthorized") toast("热重载失败: " + err.message, true);
+        if (!err.unauthorized) toast("热重载失败: " + err.message, true);
       } finally {
         btn.disabled = false;
       }
@@ -988,6 +1162,10 @@
       if (act === "proxy") openProxyModal(id);
       else if (act === "probe") probeAccountProxy(id, btn);
       else if (act === "reset-cd") resetAccountCooldown(id);
+      else if (act === "toggle") toggleAccountDisabled(id, btn.getAttribute("data-disabled") !== "1");
+      else if (act === "delete") deleteAccount(id);
+      else if (act === "open-oauth") openOAuthModal("oauth");
+      else if (act === "fetch-usage") $("btn-fetch-usage").click();
     });
 
     // Proxy modal
@@ -1020,12 +1198,155 @@
         toast(`已更新 ${id} 代理配置`);
         await fetchCore(false);
       } catch (err) {
-        if (err.message !== "unauthorized") {
+        if (!err.unauthorized) {
           $("proxy-error").textContent = err.message;
           $("proxy-error").classList.remove("hidden");
         }
       } finally {
         btn.disabled = false;
+      }
+    });
+
+    // OAuth Login & JSON Import Modal
+    $("oauth-modal-close").addEventListener("click", closeOAuthModal);
+    $("import-cancel").addEventListener("click", closeOAuthModal);
+    $("oauth-modal").addEventListener("click", (e) => {
+      if (e.target === $("oauth-modal")) closeOAuthModal();
+    });
+    $("add-acct-tabs").addEventListener("click", (e) => {
+      const btn = e.target.closest("button[data-add-mode]");
+      if (!btn) return;
+      switchAddAccountMode(btn.getAttribute("data-add-mode"));
+    });
+    document.querySelectorAll("[data-oauth-proxy]").forEach((b) => {
+      b.addEventListener("click", () => {
+        $("oauth-proxy-input").value = b.getAttribute("data-oauth-proxy");
+        $("oauth-proxy-input").focus();
+      });
+    });
+    $("oauth-start-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const btn = $("oauth-start-btn");
+      btn.disabled = true;
+      btn.textContent = "注册 OIDC 中...";
+      $("oauth-error").classList.add("hidden");
+      $("oauth-ok").classList.add("hidden");
+      try {
+        const payload = {
+          tenant_url: $("oauth-tenant-input").value.trim(),
+          id: $("oauth-id-input").value.trim(),
+          proxy_url: $("oauth-proxy-input").value.trim(),
+          region: $("oauth-region-input").value.trim(),
+          issuer_url: $("oauth-issuer-input").value.trim(),
+          scopes: $("oauth-scopes-input").value.trim(),
+          callback_port: Number($("oauth-port-input").value) || 18080,
+        };
+        const res = await apiFetch("/admin/oauth/start", {
+          method: "POST",
+          body: payload,
+        });
+        state.oauthSession = res;
+        $("oauth-auth-url").value = res.auth_url || "";
+        $("oauth-open-link").setAttribute("href", res.auth_url || "#");
+        $("oauth-redir-preview").textContent = res.redirect_uri || "http://127.0.0.1:18080/oauth/callback";
+        const mins = Math.max(1, Math.round((res.expires_in_sec || 600) / 60));
+        $("oauth-ttl-hint").textContent = `有效期 ${mins} 分钟`;
+        $("oauth-step2").classList.remove("hidden");
+        btn.textContent = "重新生成链接";
+        $("oauth-callback-input").focus();
+        toast("授权链接已生成，请在浏览器完成登录后粘贴回调 URL");
+      } catch (err) {
+        if (!err.unauthorized) {
+          $("oauth-error").textContent = err.message;
+          $("oauth-error").classList.remove("hidden");
+        }
+        btn.textContent = "生成登录链接";
+      } finally {
+        btn.disabled = false;
+      }
+    });
+    $("oauth-copy-url").addEventListener("click", () => {
+      copyToClipboard($("oauth-auth-url").value, "授权链接已复制");
+    });
+    $("oauth-reset-flow").addEventListener("click", () => {
+      resetOAuthFlow();
+      $("oauth-tenant-input").focus();
+    });
+    $("oauth-callback-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const rawCallback = $("oauth-callback-input").value.trim();
+      if (!rawCallback) return;
+      const btn = $("oauth-callback-submit");
+      btn.disabled = true;
+      btn.textContent = "换取 Token 中...";
+      $("oauth-error").classList.add("hidden");
+      $("oauth-ok").classList.add("hidden");
+      try {
+        const res = await apiFetch("/admin/oauth/callback", {
+          method: "POST",
+          body: {
+            state: (state.oauthSession && state.oauthSession.state) || "",
+            redirect_url: rawCallback,
+            tenant_url: $("oauth-tenant-input").value.trim(),
+          },
+        });
+        const acctId = (res.account && res.account.id) || (res.added && res.added[0]) || (res.updated && res.updated[0]) || "新账号";
+        const note = res.usage_ok ? "，已自动拉取初始配额" : "";
+        $("oauth-ok").textContent = `账号 ${acctId} 登录并热重载成功${note}。`;
+        $("oauth-ok").classList.remove("hidden");
+        toast(`OAuth 登录成功：${acctId}`);
+        state.oauthSession = null;
+        await fetchCore(false);
+        await fetchLogs(false);
+        setTimeout(() => closeOAuthModal(), 900);
+      } catch (err) {
+        if (!err.unauthorized) {
+          $("oauth-error").textContent = err.message;
+          $("oauth-error").classList.remove("hidden");
+        }
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "提交回调并完成登录";
+      }
+    });
+    $("import-json-form").addEventListener("submit", async (e) => {
+      e.preventDefault();
+      const rawText = $("import-json-input").value.trim();
+      if (!rawText) return;
+      $("import-error").classList.add("hidden");
+      let parsed;
+      try {
+        parsed = JSON.parse(rawText);
+      } catch (parseErr) {
+        $("import-error").textContent = "JSON 格式无效：" + parseErr.message;
+        $("import-error").classList.remove("hidden");
+        return;
+      }
+      const btn = $("import-submit");
+      btn.disabled = true;
+      btn.textContent = "导入中...";
+      try {
+        const res = await apiFetch("/admin/accounts/import", {
+          method: "POST",
+          body: {
+            payload: parsed,
+            proxy_url: $("import-proxy-input").value.trim(),
+          },
+        });
+        const addedN = (res.added || []).length;
+        const updN = (res.updated || []).length;
+        closeOAuthModal();
+        toast(`导入成功：新增 ${addedN} 个，更新 ${updN} 个`);
+        await fetchCore(false);
+        await fetchLogs(false);
+      } catch (err) {
+        if (!err.unauthorized) {
+          $("import-error").textContent = err.message;
+          $("import-error").classList.remove("hidden");
+        }
+      } finally {
+        btn.disabled = false;
+        btn.textContent = "导入并热重载";
       }
     });
 
@@ -1039,7 +1360,7 @@
         toast("模型统计已重置");
         await fetchCore(false);
       } catch (err) {
-        if (err.message !== "unauthorized") toast("重置失败: " + err.message, true);
+        if (!err.unauthorized) toast("重置失败: " + err.message, true);
       }
     });
 
@@ -1084,13 +1405,16 @@
         renderLogs();
         toast("已清空日志缓冲");
       } catch (err) {
-        if (err.message !== "unauthorized") toast("清空失败: " + err.message, true);
+        if (!err.unauthorized) toast("清空失败: " + err.message, true);
       }
     });
 
-    // Escape closes proxy modal
+    // Escape closes active modal
     document.addEventListener("keydown", (e) => {
-      if (e.key === "Escape" && !$("proxy-modal").classList.contains("hidden")) {
+      if (e.key !== "Escape") return;
+      if (!$("oauth-modal").classList.contains("hidden")) {
+        closeOAuthModal();
+      } else if (!$("proxy-modal").classList.contains("hidden")) {
         closeProxyModal();
       }
     });

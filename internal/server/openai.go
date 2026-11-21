@@ -25,32 +25,35 @@ import (
 
 // Server serves OpenAI-compatible HTTP endpoints backed by Amazon Quick.
 type Server struct {
-	cfg       config.Config
-	store     *auth.Store
-	manager   *quick.Manager
-	metrics   *telemetry.Metrics
-	logs      *telemetry.LogBuffer
-	adminAuth *adminAuthManager
-	sem       chan struct{}
-	mux       *http.ServeMux
-	imgHTTP   *http.Client
-	probeURL  string // fixed HTTPS IP echo endpoint (overridable in unit tests)
+	cfg           config.Config
+	store         *auth.Store
+	manager       *quick.Manager
+	metrics       *telemetry.Metrics
+	logs          *telemetry.LogBuffer
+	adminAuth     *adminAuthManager
+	oauthSessions *oauthSessionManager
+	sem           chan struct{}
+	mux           *http.ServeMux
+	imgHTTP       *http.Client
+	probeURL      string // fixed HTTPS IP echo endpoint (overridable in unit tests)
+	oauthBaseURL  string // optional sso-oidc override for unit tests
 }
 
 // New creates a configured HTTP handler.
 func New(cfg config.Config, store *auth.Store, manager *quick.Manager) *Server {
 	adminPass, _ := cfg.EnsureAdminPassword()
 	s := &Server{
-		cfg:       cfg,
-		store:     store,
-		manager:   manager,
-		metrics:   telemetry.NewMetrics(),
-		logs:      telemetry.NewLogBuffer(1000),
-		adminAuth: newAdminAuthManager(config.AdminUsername, adminPass),
-		sem:       make(chan struct{}, cfg.MaxConcurrentTurn),
-		mux:       http.NewServeMux(),
-		imgHTTP:   &http.Client{Timeout: 15 * time.Second},
-		probeURL:  "https://api.ipify.org?format=json",
+		cfg:           cfg,
+		store:         store,
+		manager:       manager,
+		metrics:       telemetry.NewMetrics(),
+		logs:          telemetry.NewLogBuffer(1000),
+		adminAuth:     newAdminAuthManager(config.AdminUsername, adminPass),
+		oauthSessions: newOAuthSessionManager(),
+		sem:           make(chan struct{}, cfg.MaxConcurrentTurn),
+		mux:           http.NewServeMux(),
+		imgHTTP:       &http.Client{Timeout: 15 * time.Second},
+		probeURL:      "https://api.ipify.org?format=json",
 	}
 	uiHandler := webui.Handler()
 	s.mux.HandleFunc("/", func(w http.ResponseWriter, r *http.Request) {
@@ -77,12 +80,16 @@ func New(cfg config.Config, store *auth.Store, manager *quick.Manager) *Server {
 	s.mux.HandleFunc("/admin/logs", s.withAdminAuth(s.handleAdminLogs))
 	s.mux.HandleFunc("/admin/logs/clear", s.withAdminAuth(s.handleAdminLogsClear))
 	s.mux.HandleFunc("/admin/reload", s.withAdminAuth(s.handleAdminReload))
+	s.mux.HandleFunc("/admin/oauth/start", s.withAdminAuth(s.handleAdminOAuthStart))
+	s.mux.HandleFunc("/admin/oauth/callback", s.withAdminAuth(s.handleAdminOAuthCallback))
+	s.mux.HandleFunc("/admin/accounts/import", s.withAdminAuth(s.handleAdminAccountImport))
 	s.mux.HandleFunc("/admin/accounts/proxy", s.withAdminAuth(s.handleAdminAccountProxy))
 	s.mux.HandleFunc("/admin/accounts/probe-proxy", s.withAdminAuth(s.handleAdminProbeProxy))
 	s.mux.HandleFunc("/admin/accounts/reset-cooldown", s.withAdminAuth(s.handleAdminResetCooldown))
+	s.mux.HandleFunc("/admin/accounts/toggle", s.withAdminAuth(s.handleAdminAccountToggle))
+	s.mux.HandleFunc("/admin/accounts/delete", s.withAdminAuth(s.handleAdminAccountDelete))
 	return s
 }
-
 // SetLogBuffer attaches the shared process log ring buffer to /admin/logs.
 func (s *Server) SetLogBuffer(buf *telemetry.LogBuffer) {
 	if buf != nil {
