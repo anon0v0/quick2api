@@ -242,6 +242,8 @@ export QUICK2API_ADMIN_PASSWORD="请替换为高强度管理密码"
 
 常用参数：`-config`、`-accounts`、`-id`、`-tenant-url`、`-proxy`、`-region`（默认 `us-east-1`）、`-port`（默认 `18080`）、`-headless`、`-issuer-url`、`-scopes`。
 
+`login` 会优先使用 Amazon Quick 桌面端（`~/.quickwork/profiles.json`）为同一个 `tenant_url` 记录的 AWS Identity Center issuer。每个 Quick 账号对应独立的 issuer，旧版硬编码默认值只匹配其中一个实例，其他账号会被带到 AWS Builder ID 或提示会话过期。需要覆盖时显式传 `-issuer-url https://identitycenter.amazonaws.com/ssoins-<id>`；找不到匹配项时回退默认值并打印提示。
+
 ### 方式三：Windows 桌面端一键导入（`quick2api import-desktop`）
 
 若你的 Windows 电脑已登录官方 Amazon Quick 桌面客户端，可直接从 Windows 凭据管理器读取并重组分片凭证，安全写入 `accounts.json`（不向终端输出任何明文 Token 或邮箱信息）：

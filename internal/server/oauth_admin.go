@@ -179,7 +179,11 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 	}
 	issuer := strings.TrimSpace(req.IssuerURL)
 	if issuer == "" {
-		issuer = cli.DefaultSocialIssuerURL
+		if discovered, ok := cli.DiscoverIssuerForTenant(tenantURL); ok {
+			issuer = discovered
+		} else {
+			issuer = cli.DefaultSocialIssuerURL
+		}
 	}
 	port := req.CallbackPort
 	if port == 0 {

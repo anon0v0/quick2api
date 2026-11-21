@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	// DefaultSocialIssuerURL is AWS Identity Center's public Amazon Quick social issuer.
+	// DefaultSocialIssuerURL is only a fallback. Each Amazon Quick account is backed by its own
+	// AWS Identity Center instance, so the issuer recorded by Amazon Quick Desktop is preferred.
 	DefaultSocialIssuerURL = "https://identitycenter.amazonaws.com/ssoins-72233407e73f5d00"
 	DefaultOIDCScope       = "sso:account:access"
 )
@@ -40,7 +41,7 @@ func RunLogin(args []string) error {
 	accountsPath := fs.String("accounts", "", "Target accounts.json path (overrides config.json)")
 	accountID := fs.String("id", "", "Account ID label (auto-generated if empty)")
 	region := fs.String("region", "us-east-1", "AWS sso-oidc region")
-	issuerURL := fs.String("issuer-url", DefaultSocialIssuerURL, "AWS Identity Center issuer URL")
+	issuerURL := fs.String("issuer-url", "", "AWS Identity Center issuer URL (default: discovered from Amazon Quick Desktop)")
 	tenantURL := fs.String("tenant-url", "", "Amazon Quick cell tenant URL (https://<cell>.dp.appintegrations.<region>.prod.plato.ai.aws.dev)")
 	scopesCSV := fs.String("scopes", DefaultOIDCScope, "Comma-separated OIDC scopes")
 	port := fs.Int("port", 18080, "Local loopback callback port on 127.0.0.1")
@@ -76,12 +77,13 @@ func RunLogin(args []string) error {
 	if reg == "" {
 		reg = "us-east-1"
 	}
-	issuer := strings.TrimSpace(*issuerURL)
-	if issuer == "" {
-		return errors.New("issuer-url is required")
-	}
-
 	tURL := strings.TrimRight(strings.TrimSpace(*tenantURL), "/")
+	if tURL == "" {
+		if discovered, ok := singleDesktopProfile(); ok {
+			tURL = discovered.LoginMetadata.TenantURL
+			fmt.Printf("Using tenant_url from Amazon Quick Desktop: %s\n", tURL)
+		}
+	}
 	if tURL == "" {
 		fmt.Print("Enter Amazon Quick tenant_url (e.g. https://<cell>.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev): ")
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
@@ -89,6 +91,17 @@ func RunLogin(args []string) error {
 			return fmt.Errorf("read tenant_url: %w", err)
 		}
 		tURL = strings.TrimRight(strings.TrimSpace(line), "/")
+	}
+
+	issuer := strings.TrimSpace(*issuerURL)
+	if issuer == "" {
+		if discovered, ok := desktopProfileForTenant(tURL); ok {
+			issuer = discovered.LoginMetadata.IssuerURL
+			fmt.Printf("Using issuer from Amazon Quick Desktop: %s\n", issuer)
+		} else {
+			issuer = DefaultSocialIssuerURL
+			fmt.Printf("No Amazon Quick Desktop profile matched this tenant; falling back to %s\n", issuer)
+		}
 	}
 	if parsed, err := url.Parse(tURL); err != nil || parsed.Scheme != "https" || parsed.Host == "" {
 		return errors.New("invalid tenant_url: must be a valid https:// URL")
