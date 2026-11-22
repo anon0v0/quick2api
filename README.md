@@ -240,7 +240,14 @@ export QUICK2API_ADMIN_PASSWORD="请替换为高强度管理密码"
   -tenant-url https://your-cell.dp.appintegrations.us-east-1.prod.plato.ai.aws.dev
 ```
 
-常用参数：`-config`、`-accounts`、`-id`、`-tenant-url`、`-proxy`、`-region`（默认 `us-east-1`）、`-port`（默认 `18080`）、`-headless`、`-issuer-url`、`-scopes`。
+常用参数：`-config`、`-accounts`、`-id`、`-tenant-url`、`-proxy`、`-region`（默认按 `tenant_url` 自动推断，缺省 `us-east-1`）、`-port`（默认 `18080`）、`-headless`、`-issuer-url`、`-scopes`。
+
+每个 Amazon Quick 账号绑定独立的 AWS Identity Center `issuer_url`（`ssoins-...`）。无论是 `quick2api login` 还是 Web 控制台的 `/admin/oauth/start`，都会按以下优先级自动解析 `issuer_url`（避免落回其他实例导致跳转到 AWS Builder ID 或提示会话过期）：
+1. 显式传入的 `-issuer-url` / `issuer_url`；
+2. 官方 `quick.aws.com` 发现回调链接中携带的 `issuer_url` / `idc_instance_id`；
+3. 现有账号池 / `accounts.json` 中与同一 `tenant_url` 匹配的唯一记录（无桌面端环境的远程 VPS 也可复用）；
+4. 本机 Amazon Quick 桌面端配置（`~/.quickwork/profiles.json`）中为同一 `tenant_url` 记录的 `social` 账号；
+5. 以上均未命中时回退默认值并输出警告提示。若命令行未传 `-tenant-url` 且本机桌面端仅存在唯一 `social` 账号，可直接按回车复用该桌面配置，或粘贴新的 `quick.aws.com` 发现回调添加其他账号。
 
 ### 方式三：Windows 桌面端一键导入（`quick2api import-desktop`）
 

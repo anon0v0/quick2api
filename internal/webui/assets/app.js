@@ -1114,6 +1114,8 @@
     $("oauth-disc-copy").classList.add("hidden");
     $("oauth-disc-badge").classList.add("hidden");
     $("oauth-tenant-input").value = "";
+    $("oauth-region-input").value = "";
+    $("oauth-issuer-input").value = "";
     $("oauth-scopes-input").value = "quicksight:read_write";
     const firstWithHost = ((state.status && state.status.accounts) || []).find((a) => a.tenant_host);
     $("btn-reuse-tenant").classList.toggle("hidden", !firstWithHost);
@@ -1402,7 +1404,9 @@
       const firstWithHost = ((state.status && state.status.accounts) || []).find((a) => a.tenant_host);
       if (firstWithHost) {
         $("oauth-tenant-input").value = "https://" + firstWithHost.tenant_host;
-        toast("已填入池内首个账号的租户地址（仅限同租户/重登原账号）");
+        $("oauth-region-input").value = "";
+        $("oauth-issuer-input").value = "";
+        toast("已填入池内首个账号的租户地址（后端将自动匹配其 issuer 与区域）");
       }
     });
     $("oauth-start-form").addEventListener("submit", async (e) => {

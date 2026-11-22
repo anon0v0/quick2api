@@ -28,7 +28,8 @@ import (
 )
 
 const (
-	// DefaultSocialIssuerURL is AWS Identity Center's public Amazon Quick social issuer.
+	// DefaultSocialIssuerURL is only a fallback. Each Amazon Quick account is backed by its own
+	// AWS Identity Center instance, so the issuer recorded by Amazon Quick Desktop is preferred.
 	DefaultSocialIssuerURL = "https://identitycenter.amazonaws.com/ssoins-72233407e73f5d00"
 	// DefaultOIDCScope is the production OIDC scope required by Amazon Quick DataPlane APIs.
 	DefaultOIDCScope = "quicksight:read_write"
@@ -148,16 +149,57 @@ func ParseDiscoveryCallback(rawInput string) (DiscoveryParams, error) {
 		out.IssuerURL = "https://identitycenter.amazonaws.com/" + out.IDCInstanceID
 	}
 	if out.Region == "" {
-		// Infer region from tenant host if formatted like <cell>.dp.appintegrations.<region>.prod.plato.ai.aws.dev
-		parts := strings.Split(strings.TrimPrefix(out.TenantURL, "https://"), ".")
-		for _, p := range parts {
-			if len(p) >= 9 && strings.Count(p, "-") == 2 && (strings.HasPrefix(p, "us-") || strings.HasPrefix(p, "eu-") || strings.HasPrefix(p, "ap-") || strings.HasPrefix(p, "ca-") || strings.HasPrefix(p, "sa-") || strings.HasPrefix(p, "me-") || strings.HasPrefix(p, "af-")) {
-				out.Region = p
-				break
-			}
-		}
+		out.Region = InferRegionFromTenantURL(out.TenantURL)
 	}
 	return out, nil
+}
+
+// InferRegionFromTenantURL extracts the AWS region embedded in a Quick DataPlane host
+// such as `<cell>.dp.appintegrations.<region>.prod.plato.ai.aws.dev`.
+func InferRegionFromTenantURL(tenantURL string) string {
+	host := strings.TrimPrefix(strings.TrimPrefix(strings.TrimSpace(tenantURL), "https://"), "http://")
+	if idx := strings.IndexByte(host, '/'); idx >= 0 {
+		host = host[:idx]
+	}
+	for _, p := range strings.Split(host, ".") {
+		if len(p) >= 9 && strings.Count(p, "-") == 2 &&
+			(strings.HasPrefix(p, "us-") || strings.HasPrefix(p, "eu-") || strings.HasPrefix(p, "ap-") ||
+				strings.HasPrefix(p, "ca-") || strings.HasPrefix(p, "sa-") || strings.HasPrefix(p, "me-") ||
+				strings.HasPrefix(p, "af-")) {
+			return p
+		}
+	}
+	return ""
+}
+
+func discoverIssuerFromAccountsFile(path, tenantURL string) (string, bool) {
+	if strings.TrimSpace(path) == "" {
+		return "", false
+	}
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return "", false
+	}
+	accts, err := auth.ParseAccountsJSONBytes(raw)
+	if err != nil {
+		return "", false
+	}
+	tenantURL = strings.TrimRight(strings.TrimSpace(tenantURL), "/")
+	found := ""
+	for _, a := range accts {
+		if a == nil || !strings.EqualFold(strings.TrimRight(strings.TrimSpace(a.TenantURL), "/"), tenantURL) {
+			continue
+		}
+		iss := strings.TrimRight(strings.TrimSpace(a.IssuerURL), "/")
+		if !isValidHTTPSURL(iss) {
+			continue
+		}
+		if found != "" && !strings.EqualFold(found, iss) {
+			return "", false
+		}
+		found = iss
+	}
+	return found, found != ""
 }
 
 // RunLogin executes the interactive or headless AWS sso-oidc PKCE login flow and upserts the account.
@@ -166,8 +208,8 @@ func RunLogin(args []string) error {
 	cfgPath := fs.String("config", "", "Optional config.json path to resolve accounts_file and global proxy_url")
 	accountsPath := fs.String("accounts", "", "Target accounts.json path (overrides config.json)")
 	accountID := fs.String("id", "", "Account ID label (auto-generated if empty)")
-	region := fs.String("region", "us-east-1", "AWS sso-oidc region")
-	issuerURL := fs.String("issuer-url", DefaultSocialIssuerURL, "AWS Identity Center issuer URL")
+	region := fs.String("region", "", "AWS sso-oidc region (default: inferred from tenant_url or us-east-1)")
+	issuerURL := fs.String("issuer-url", "", "AWS Identity Center issuer URL (default: discovered from callback, accounts.json, or Amazon Quick Desktop)")
 	tenantURL := fs.String("tenant-url", "", "Amazon Quick cell tenant URL (https://<cell>.dp.appintegrations.<region>.prod.plato.ai.aws.dev)")
 	scopesCSV := fs.String("scopes", DefaultOIDCScope, "Comma-separated OIDC scopes")
 	port := fs.Int("port", 18080, "Local loopback callback port on 127.0.0.1")
@@ -200,45 +242,72 @@ func RunLogin(args []string) error {
 	effProxy := netproxy.Resolve(acctProxy, globalProxy)
 
 	reg := strings.TrimSpace(*region)
-	if reg == "" {
-		reg = "us-east-1"
-	}
-	issuer := strings.TrimSpace(*issuerURL)
-	if issuer == "" {
-		return errors.New("issuer-url is required")
-	}
-
+	issuer := strings.TrimRight(strings.TrimSpace(*issuerURL), "/")
 	tURL := strings.TrimRight(strings.TrimSpace(*tenantURL), "/")
 	if tURL == "" {
+		desktopDefault, hasDesktopDefault := singleDesktopProfile()
 		discURL := BuildDiscoveryURL(DefaultSocialDiscoveryURL, randomHex(12), *port, DefaultDesktopAppVersion)
-		fmt.Println("\nNo -tenant-url provided. Open this official Amazon Quick discovery URL in your browser to auto-discover your account's tenant_url:")
+		fmt.Println("\nNo -tenant-url provided. Open this official Amazon Quick discovery URL in your browser to auto-discover your account's tenant_url & issuer_url:")
 		fmt.Println(discURL)
-		fmt.Print("\nPaste the redirected 127.0.0.1 discovery URL (or a direct https:// tenant_url): ")
+		if hasDesktopDefault {
+			fmt.Printf("\nDetected Amazon Quick Desktop profile: %s\n", desktopDefault.LoginMetadata.TenantURL)
+			fmt.Print("Press Enter to reuse this desktop profile, or paste a 127.0.0.1 discovery callback URL / https:// tenant_url for another account: ")
+		} else {
+			fmt.Print("\nPaste the redirected 127.0.0.1 discovery URL (or a direct https:// tenant_url): ")
+		}
 		line, err := bufio.NewReader(os.Stdin).ReadString('\n')
 		if err != nil && !errors.Is(err, io.EOF) {
 			return fmt.Errorf("read tenant_url: %w", err)
 		}
-		disc, err := ParseDiscoveryCallback(line)
-		if err != nil {
-			return err
-		}
-		tURL = disc.TenantURL
-		if disc.IssuerURL != "" && issuer == DefaultSocialIssuerURL {
-			issuer = disc.IssuerURL
-		}
-		if disc.Region != "" && reg == "us-east-1" {
-			reg = disc.Region
+		if strings.TrimSpace(line) == "" && hasDesktopDefault {
+			tURL = desktopDefault.LoginMetadata.TenantURL
+			if issuer == "" {
+				issuer = desktopDefault.LoginMetadata.IssuerURL
+			}
+			fmt.Printf("Using Amazon Quick Desktop profile: tenant=%s issuer=%s\n", tURL, issuer)
+		} else {
+			disc, err := ParseDiscoveryCallback(line)
+			if err != nil {
+				return err
+			}
+			tURL = disc.TenantURL
+			if disc.IssuerURL != "" && issuer == "" {
+				issuer = disc.IssuerURL
+			}
+			if disc.Region != "" && reg == "" {
+				reg = disc.Region
+			}
 		}
 	}
-	if parsed, err := url.Parse(tURL); err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if parsed, err := url.Parse(tURL); err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
 		return errors.New("invalid tenant_url: must be a valid https:// URL")
+	}
+	if issuer != "" && !isValidHTTPSURL(issuer) {
+		return errors.New("invalid issuer_url: must be a valid https:// URL")
+	}
+	if reg == "" {
+		reg = InferRegionFromTenantURL(tURL)
+	}
+	if reg == "" {
+		reg = "us-east-1"
+	}
+	if issuer == "" {
+		if discovered, ok := discoverIssuerFromAccountsFile(targetAccounts, tURL); ok {
+			issuer = discovered
+			fmt.Printf("Using issuer from existing accounts file: %s\n", issuer)
+		} else if discovered, ok := desktopProfileForTenant(tURL); ok {
+			issuer = discovered.LoginMetadata.IssuerURL
+			fmt.Printf("Using issuer from Amazon Quick Desktop: %s\n", issuer)
+		} else {
+			issuer = DefaultSocialIssuerURL
+			fmt.Printf("Warning: no matching issuer found in accounts file or Quick Desktop; falling back to %s (pass -issuer-url or use quick.aws.com discovery if login shows Builder ID / session expired)\n", issuer)
+		}
 	}
 
 	scopes := splitCSV(*scopesCSV)
 	if len(scopes) == 0 {
 		scopes = []string{DefaultOIDCScope}
 	}
-
 	tr, err := netproxy.NewTransport(nil, effProxy)
 	if err != nil {
 		return err

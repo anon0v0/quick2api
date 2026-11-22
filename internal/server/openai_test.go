@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"quick2api/internal/auth"
+	"quick2api/internal/cli"
 	"quick2api/internal/config"
 	"quick2api/internal/prompt"
 	"quick2api/internal/quick"
@@ -805,5 +806,128 @@ func TestServeRetryableTransientAuthOverflowAndImageDedup(t *testing.T) {
 	}
 	if uploadCount != 1 || len(atts) != 1 || atts[0].Path != "/data/s3files/sessions/tid-dedup/workspace/attached_files/img.jpg" {
 		t.Fatalf("expected 1 deduplicated delivered attachment, got uploads=%d atts=%+v", uploadCount, atts)
+	}
+}
+
+func TestAdminOAuthStartIssuerAndRegionResolution(t *testing.T) {
+	dir := t.TempDir()
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("USERPROFILE", home)
+
+	quickworkDir := filepath.Join(home, ".quickwork")
+	if err := os.MkdirAll(quickworkDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	profilesBody := `{"version":1,"entries":[
+		{"provider":"social","login_metadata":{
+			"tenant_url":"https://cell-pool.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev",
+			"issuer_url":"https://identitycenter.amazonaws.com/ssoins-desktop-shadowed"
+		}},
+		{"provider":"social","login_metadata":{
+			"tenant_url":"https://cell-desktop.dp.appintegrations.eu-west-1.prod.plato.ai.aws.dev/",
+			"issuer_url":"https://identitycenter.amazonaws.com/ssoins-desktop-only/"
+		}},
+		{"provider":"social","login_metadata":{
+			"tenant_url":"https://cell-conflict.dp.appintegrations.ap-northeast-1.prod.plato.ai.aws.dev",
+			"issuer_url":"https://identitycenter.amazonaws.com/ssoins-desktop-fallback"
+		}}
+	]}`
+	if err := os.WriteFile(filepath.Join(quickworkDir, "profiles.json"), []byte(profilesBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	accPath := filepath.Join(dir, "accounts.json")
+	acctsBody := `{"accounts":[
+		{"id":"p1","tenant_url":"https://cell-pool.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev","issuer_url":"https://identitycenter.amazonaws.com/ssoins-pool-primary","region":"us-west-2","access_token":"at1","access_token_expiry":2000000000},
+		{"id":"c1","tenant_url":"https://cell-conflict.dp.appintegrations.ap-northeast-1.prod.plato.ai.aws.dev","issuer_url":"https://identitycenter.amazonaws.com/ssoins-conflict-1","region":"ap-northeast-1","access_token":"at2","access_token_expiry":2000000000},
+		{"id":"c2","tenant_url":"https://cell-conflict.dp.appintegrations.ap-northeast-1.prod.plato.ai.aws.dev","issuer_url":"https://identitycenter.amazonaws.com/ssoins-conflict-2","region":"ap-northeast-1","access_token":"at3","access_token_expiry":2000000000}
+	]}`
+	if err := os.WriteFile(accPath, []byte(acctsBody), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	store, err := auth.NewStore(accPath, 5*time.Minute, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	mgr, err := quick.NewManager(store, "QUICK_WORK_DESKTOP_WINDOWS", true, "", false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg := config.Default()
+	cfg.APIKeys = []string{"admin-secret"}
+	cfg.AccountsFile = accPath
+	srv := New(cfg, store, mgr)
+
+	var lastRegisteredIssuer string
+	oidcMock := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		if r.URL.Path == "/client/register" {
+			var body map[string]any
+			_ = json.NewDecoder(r.Body).Decode(&body)
+			lastRegisteredIssuer, _ = body["issuerUrl"].(string)
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"clientId":              "cid",
+				"clientSecret":          "csec",
+				"clientSecretExpiresAt": time.Now().Add(time.Hour).Unix(),
+			})
+			return
+		}
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer oidcMock.Close()
+	srv.oauthBaseURL = oidcMock.URL
+
+	start := func(body string) (int, map[string]any) {
+		lastRegisteredIssuer = ""
+		req := httptest.NewRequest(http.MethodPost, "/admin/oauth/start", strings.NewReader(body))
+		req.Header.Set("Authorization", "Bearer admin-secret")
+		req.Header.Set("Content-Type", "application/json")
+		w := httptest.NewRecorder()
+		srv.ServeHTTP(w, req)
+		var resp map[string]any
+		_ = json.Unmarshal(w.Body.Bytes(), &resp)
+		return w.Code, resp
+	}
+
+	// 0. Non-HTTPS explicit issuer_url is rejected with 400.
+	if code, _ := start(`{"tenant_url":"https://cell-pool.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev","issuer_url":"http://bad.example/ssoins"}`); code != http.StatusBadRequest {
+		t.Fatalf("expected 400 for non-HTTPS issuer_url, got %d", code)
+	}
+
+	// 1. Explicit issuer_url overrides both pool and desktop profile.
+	code, resp := start(`{"tenant_url":"https://cell-pool.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev","issuer_url":"https://identitycenter.amazonaws.com/ssoins-explicit/"}`)
+	if code != http.StatusOK || lastRegisteredIssuer != "https://identitycenter.amazonaws.com/ssoins-explicit" || resp["region"] != "us-west-2" {
+		t.Fatalf("explicit override failed: code=%d registered=%q resp=%+v", code, lastRegisteredIssuer, resp)
+	}
+
+	// 2. Discovery callback issuer/region overrides legacy default values.
+	code, resp = start(`{"discovery_callback_url":"http://127.0.0.1:18080/?tenantUrl=https%3A%2F%2Fcell-pool.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev&idcInstanceId=ssoins-from-disc&idcRegion=us-west-2","issuer_url":"` + cli.DefaultSocialIssuerURL + `","region":"us-east-1"}`)
+	if code != http.StatusOK || lastRegisteredIssuer != "https://identitycenter.amazonaws.com/ssoins-from-disc" || resp["region"] != "us-west-2" {
+		t.Fatalf("discovery override failed: code=%d registered=%q resp=%+v", code, lastRegisteredIssuer, resp)
+	}
+
+	// 3. Matching pool account wins over desktop profile and inherits region.
+	code, resp = start(`{"tenant_url":"https://cell-pool.dp.appintegrations.us-west-2.prod.plato.ai.aws.dev"}`)
+	if code != http.StatusOK || lastRegisteredIssuer != "https://identitycenter.amazonaws.com/ssoins-pool-primary" || resp["region"] != "us-west-2" {
+		t.Fatalf("pool issuer resolution failed: code=%d registered=%q resp=%+v", code, lastRegisteredIssuer, resp)
+	}
+
+	// 4. Conflicting pool issuers do not guess and fall through to desktop profile.
+	code, resp = start(`{"tenant_url":"https://cell-conflict.dp.appintegrations.ap-northeast-1.prod.plato.ai.aws.dev"}`)
+	if code != http.StatusOK || lastRegisteredIssuer != "https://identitycenter.amazonaws.com/ssoins-desktop-fallback" || resp["region"] != "ap-northeast-1" {
+		t.Fatalf("conflict fallthrough to desktop failed: code=%d registered=%q resp=%+v", code, lastRegisteredIssuer, resp)
+	}
+
+	// 5. Desktop profile discovery applies when pool has no match, and region is inferred from tenant_url.
+	code, resp = start(`{"tenant_url":"https://cell-desktop.dp.appintegrations.eu-west-1.prod.plato.ai.aws.dev"}`)
+	if code != http.StatusOK || lastRegisteredIssuer != "https://identitycenter.amazonaws.com/ssoins-desktop-only" || resp["region"] != "eu-west-1" {
+		t.Fatalf("desktop issuer + region inference failed: code=%d registered=%q resp=%+v", code, lastRegisteredIssuer, resp)
+	}
+
+	// 6. Unknown tenant falls back to DefaultSocialIssuerURL and inferred region (or us-east-1).
+	code, resp = start(`{"tenant_url":"https://cell-unknown.dp.appintegrations.ca-central-1.prod.plato.ai.aws.dev"}`)
+	if code != http.StatusOK || lastRegisteredIssuer != cli.DefaultSocialIssuerURL || resp["region"] != "ca-central-1" {
+		t.Fatalf("fallback resolution failed: code=%d registered=%q resp=%+v", code, lastRegisteredIssuer, resp)
 	}
 }

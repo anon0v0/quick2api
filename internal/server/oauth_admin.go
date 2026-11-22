@@ -131,6 +131,44 @@ func splitOAuthScopes(csv string) []string {
 	}
 	return out
 }
+func matchPoolMetaForTenant(accounts []auth.Account, tenantURL string) (issuer string, region string) {
+	tenant := strings.TrimRight(strings.TrimSpace(tenantURL), "/")
+	if tenant == "" {
+		return "", ""
+	}
+	var foundIssuer string
+	issuerConflict := false
+	var foundRegion string
+	regionConflict := false
+	for _, a := range accounts {
+		if !strings.EqualFold(strings.TrimRight(strings.TrimSpace(a.TenantURL), "/"), tenant) {
+			continue
+		}
+		if iss := strings.TrimRight(strings.TrimSpace(a.IssuerURL), "/"); iss != "" {
+			if u, err := url.Parse(iss); err == nil && strings.EqualFold(u.Scheme, "https") && u.Host != "" {
+				if foundIssuer != "" && !strings.EqualFold(foundIssuer, iss) {
+					issuerConflict = true
+				} else {
+					foundIssuer = iss
+				}
+			}
+		}
+		if reg := strings.TrimSpace(a.Region); reg != "" {
+			if foundRegion != "" && !strings.EqualFold(foundRegion, reg) {
+				regionConflict = true
+			} else {
+				foundRegion = reg
+			}
+		}
+	}
+	if issuerConflict {
+		foundIssuer = ""
+	}
+	if regionConflict {
+		foundRegion = ""
+	}
+	return foundIssuer, foundRegion
+}
 
 func (s *Server) handleAdminOAuthDiscover(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodPost {
@@ -194,7 +232,13 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 
 	tenantURL := strings.TrimRight(strings.TrimSpace(req.TenantURL), "/")
 	region := strings.TrimSpace(req.Region)
-	issuer := strings.TrimSpace(req.IssuerURL)
+	issuer := strings.TrimRight(strings.TrimSpace(req.IssuerURL), "/")
+	if issuer != "" {
+		if parsedIss, err := url.Parse(issuer); err != nil || !strings.EqualFold(parsedIss.Scheme, "https") || parsedIss.Host == "" {
+			writeOpenAIError(w, http.StatusBadRequest, "invalid_issuer_url", "invalid_request_error", "issuer_url must be a valid https:// URL.")
+			return
+		}
+	}
 
 	if discRaw := strings.TrimSpace(req.DiscoveryCallbackURL); discRaw != "" {
 		disc, err := cli.ParseDiscoveryCallback(discRaw)
@@ -210,25 +254,41 @@ func (s *Server) handleAdminOAuthStart(w http.ResponseWriter, r *http.Request) {
 			region = disc.Region
 		}
 	}
+	snapshot := s.store.AccountsSnapshot()
 	if tenantURL == "" {
 		// Fallback: reuse existing tenant_url from pool if available.
-		for _, existing := range s.store.AccountsSnapshot() {
+		for _, existing := range snapshot {
 			if existing.TenantURL != "" {
-				tenantURL = existing.TenantURL
+				tenantURL = strings.TrimRight(strings.TrimSpace(existing.TenantURL), "/")
 				break
 			}
 		}
 	}
-	if parsed, err := url.Parse(tenantURL); err != nil || parsed.Scheme != "https" || parsed.Host == "" {
+	if parsed, err := url.Parse(tenantURL); err != nil || !strings.EqualFold(parsed.Scheme, "https") || parsed.Host == "" {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_tenant_url", "invalid_request_error", "A valid https:// tenant_url (or discovery_callback_url from quick.aws.com) is required.")
 		return
 	}
 
-	if region == "" {
-		region = "us-east-1"
+	poolIssuer, poolRegion := matchPoolMetaForTenant(snapshot, tenantURL)
+	if issuer == "" && poolIssuer != "" {
+		issuer = poolIssuer
 	}
 	if issuer == "" {
-		issuer = cli.DefaultSocialIssuerURL
+		if discovered, ok := cli.DiscoverIssuerForTenant(tenantURL); ok {
+			issuer = discovered
+		} else {
+			issuer = cli.DefaultSocialIssuerURL
+			log.Printf("[admin] warning: no matching issuer found in pool or Quick Desktop for %s; falling back to %s", tenantURL, issuer)
+		}
+	}
+	if region == "" && poolRegion != "" {
+		region = poolRegion
+	}
+	if region == "" {
+		region = cli.InferRegionFromTenantURL(tenantURL)
+	}
+	if region == "" {
+		region = "us-east-1"
 	}
 	port := req.CallbackPort
 	if port == 0 {

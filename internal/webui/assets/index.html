@@ -422,8 +422,8 @@
             <div class="adv-body">
               <div class="form-grid-2">
                 <div>
-                  <label class="field-label" for="oauth-region-input">区域（region）</label>
-                  <input id="oauth-region-input" type="text" class="input mono" value="us-east-1" />
+                  <label class="field-label" for="oauth-region-input">区域（region，留空自动推断）</label>
+                  <input id="oauth-region-input" type="text" class="input mono" placeholder="自动推断（默认 us-east-1）" />
                 </div>
                 <div>
                   <label class="field-label" for="oauth-port-input">回调端口（127.0.0.1）</label>
@@ -435,8 +435,8 @@
                 <input id="oauth-scopes-input" type="text" class="input mono" value="quicksight:read_write" />
               </div>
               <div>
-                <label class="field-label" for="oauth-issuer-input">Issuer URL</label>
-                <input id="oauth-issuer-input" type="url" class="input mono" value="https://identitycenter.amazonaws.com/ssoins-72233407e73f5d00" />
+                <label class="field-label" for="oauth-issuer-input">Issuer URL（留空自动发现）</label>
+                <input id="oauth-issuer-input" type="url" class="input mono" placeholder="自动从发现回调 / 账号池 / 桌面端识别" />
               </div>
             </div>
           </details>
