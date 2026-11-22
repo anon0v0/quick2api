@@ -22,6 +22,7 @@ import (
 	"quick2api/internal/auth"
 	"quick2api/internal/netproxy"
 )
+
 // AuthError indicates an HTTP 401/403 from the Quick AIDP gateway (token rejected).
 type AuthError struct {
 	Status int
@@ -46,16 +47,19 @@ type Attachment struct {
 
 // TurnRequest holds all parameters to start one Quick chat turn.
 type TurnRequest struct {
-	ThreadID            string
-	Text                string
-	CustomPrompt        string
-	CompactCustomPrompt string
-	StageableCustomBody string
-	AgentMode           string
-	ThinkingEffort      string
-	Attachments         []Attachment
-	SurfaceType         string
+	ThreadID               string
+	Text                   string
+	CustomPrompt           string
+	CompactCustomPrompt    string
+	ToolInlineCustomPrompt string
+	StageableSystemBody    string
+	StageableCustomBody    string
+	AgentMode              string
+	ThinkingEffort         string
+	Attachments            []Attachment
+	SurfaceType            string
 }
+
 // TurnUsage holds token and model metadata emitted by Quick's turn_usage frame.
 type TurnUsage struct {
 	InputTokens      int     `json:"input_tokens"`
@@ -81,6 +85,7 @@ type StreamEvent struct {
 	FailedFrame string
 	ToolName    string
 }
+
 // Manager manages per-account persistent AIDP WebSocket connections and REST calls.
 type Manager struct {
 	store         *auth.Store
@@ -156,6 +161,7 @@ func (m *Manager) getIdleTimeout() time.Duration {
 	defer m.mu.Unlock()
 	return m.idleTimeout
 }
+
 // Close terminates all open WebSocket connections cleanly.
 func (m *Manager) Close() {
 	m.mu.Lock()
@@ -272,8 +278,10 @@ func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnReq
 
 	ch := conn.registerThread(threadID)
 	if len(turns) > 1 {
-		log.Printf("[quick-ws] staging oversized prompt account=%s thread=%s inner_bytes=%d parts=%d",
-			acct.ID, threadID, rawInnerBytes, len(turns))
+		finalCPLen := len(turns[len(turns)-1].CustomPrompt)
+		keepInline := req.CustomPrompt == "" || turns[len(turns)-1].CustomPrompt == req.CustomPrompt
+		log.Printf("[quick-ws] staging oversized prompt account=%s thread=%s inner_bytes=%d cp_bytes=%d final_cp_bytes=%d text_bytes=%d atts=%d keep_cp_inline=%v parts=%d",
+			acct.ID, threadID, rawInnerBytes, len(req.CustomPrompt), finalCPLen, len(req.Text), len(req.Attachments), keepInline, len(turns))
 	}
 
 	first := turns[0]
@@ -406,6 +414,8 @@ func (m *Manager) StreamTurn(ctx context.Context, acct auth.Account, req TurnReq
 				if stageIdx < lastIdx {
 					switch ev.Kind {
 					case "error", "guardrail_blocked", "usage_blocked", "rate_limited":
+						log.Printf("[quick-ws] staged turn aborted account=%s thread=%s part=%d/%d kind=%s code=%s",
+							acct.ID, threadID, stageIdx+1, len(turns), ev.Kind, ev.ErrorCode)
 						emit(ev)
 						return
 					case "complete":
@@ -1386,6 +1396,7 @@ func (c *accountConn) dispatchUnscopedError(ev StreamEvent) {
 		sub.send(ev, true)
 	}
 }
+
 // NewUUID generates a random RFC 4122 v4 UUID string.
 func NewUUID() string {
 	var b [16]byte

@@ -22,15 +22,16 @@ type PendingImage struct {
 
 // ConvertedPrompt is the rendered Quick payload derived from an OpenAI ChatCompletionRequest.
 type ConvertedPrompt struct {
-	CustomPrompt        string
-	CompactCustomPrompt string
-	StageableCustomBody string
-	Text                string
-	Images              []PendingImage
-	ToolMode            bool
-	AllowedTools        map[string]bool
+	CustomPrompt           string
+	CompactCustomPrompt    string
+	ToolInlineCustomPrompt string
+	StageableSystemBody    string
+	StageableCustomBody    string
+	Text                   string
+	Images                 []PendingImage
+	ToolMode               bool
+	AllowedTools           map[string]bool
 }
-
 type contentPart struct {
 	Type     string          `json:"type"`
 	Text     string          `json:"text,omitempty"`
@@ -198,9 +199,13 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 	// and put per-turn dynamic directives (tool_choice required/forced + response_format) last.
 	var cpParts []string
 	var compactParts []string
+	var toolInlineParts []string
+	var stageableSystemParts []string
 	var stageableParts []string
 	if toolMode {
-		cpParts = append(cpParts, buildToolSystemDirective(tools))
+		toolDir := buildToolSystemDirective(tools)
+		cpParts = append(cpParts, toolDir)
+		toolInlineParts = append(toolInlineParts, toolDir)
 		compactParts = append(compactParts, buildCompactToolReminder())
 		stageableParts = append(stageableParts, buildToolCatalogOnly(tools))
 	} else {
@@ -211,6 +216,7 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 	if len(leadingSystems) > 0 {
 		joinedSys := strings.Join(leadingSystems, "\n\n")
 		cpParts = append(cpParts, joinedSys)
+		stageableSystemParts = append(stageableSystemParts, joinedSys)
 		stageableParts = append(stageableParts, joinedSys)
 	}
 
@@ -219,10 +225,12 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 		case "required":
 			d := "[Tool Choice = REQUIRED] You MUST call at least one of the declared caller tools in this turn."
 			cpParts = append(cpParts, d)
+			toolInlineParts = append(toolInlineParts, d)
 			compactParts = append(compactParts, d)
 		case "function":
 			d := fmt.Sprintf("[Tool Choice = FORCED] You MUST call the declared tool named %q in this turn.", forcedToolName)
 			cpParts = append(cpParts, d)
+			toolInlineParts = append(toolInlineParts, d)
 			compactParts = append(compactParts, d)
 		}
 	}
@@ -230,18 +238,22 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 	if rf := parseResponseFormatDirective(req.ResponseFormat); rf != "" {
 		cpParts = append(cpParts, rf)
 		if len(rf) <= 4000 {
+			toolInlineParts = append(toolInlineParts, rf)
 			compactParts = append(compactParts, rf)
 		} else {
+			stageableSystemParts = append(stageableSystemParts, rf)
 			stageableParts = append(stageableParts, rf)
-			compactParts = append(compactParts, "[Output Format] Follow the JSON Schema output format from the reference notes above, returning valid JSON only with no markdown fences.")
+			rfHint := "[Output Format] Follow the JSON Schema output format from the reference notes above, returning valid JSON only with no markdown fences."
+			toolInlineParts = append(toolInlineParts, rfHint)
+			compactParts = append(compactParts, rfHint)
 		}
 	}
 	compactCustomPrompt := strings.Join(compactParts, "\n\n")
+	toolInlineCustomPrompt := strings.Join(toolInlineParts, "\n\n")
+	stageableSystemBody := strings.Join(stageableSystemParts, "\n\n")
 	stageableCustomBody := strings.Join(stageableParts, "\n\n")
 	imgCounter := 0
 	var allImages []PendingImage
-
-	// Fast path: single plain user turn (no history, no tool results, no prefill).
 	if len(rest) == 1 && strings.EqualFold(rest[0].Role, "user") && len(rest[0].ToolCalls) == 0 && rest[0].FunctionCall == nil {
 		txt, imgs := ExtractMessageContent(rest[0].Content, &imgCounter)
 		allImages = append(allImages, imgs...)
@@ -249,13 +261,15 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 			txt = "Continue."
 		}
 		return ConvertedPrompt{
-			CustomPrompt:        strings.Join(cpParts, "\n\n"),
-			CompactCustomPrompt: compactCustomPrompt,
-			StageableCustomBody: stageableCustomBody,
-			Text:                txt,
-			Images:              allImages,
-			ToolMode:            toolMode,
-			AllowedTools:        allowed,
+			CustomPrompt:           strings.Join(cpParts, "\n\n"),
+			CompactCustomPrompt:    compactCustomPrompt,
+			ToolInlineCustomPrompt: toolInlineCustomPrompt,
+			StageableSystemBody:    stageableSystemBody,
+			StageableCustomBody:    stageableCustomBody,
+			Text:                   txt,
+			Images:                 allImages,
+			ToolMode:               toolMode,
+			AllowedTools:           allowed,
 		}
 	}
 	// Build tool_call_id -> function name index so role:tool results without `name` stay labeled clearly.
@@ -381,13 +395,15 @@ func Convert(req ChatCompletionRequest) ConvertedPrompt {
 	}
 
 	return ConvertedPrompt{
-		CustomPrompt:        strings.Join(cpParts, "\n\n"),
-		CompactCustomPrompt: compactCustomPrompt,
-		StageableCustomBody: stageableCustomBody,
-		Text:                sb.String(),
-		Images:              allImages,
-		ToolMode:            toolMode,
-		AllowedTools:        allowed,
+		CustomPrompt:           strings.Join(cpParts, "\n\n"),
+		CompactCustomPrompt:    compactCustomPrompt,
+		ToolInlineCustomPrompt: toolInlineCustomPrompt,
+		StageableSystemBody:    stageableSystemBody,
+		StageableCustomBody:    stageableCustomBody,
+		Text:                   sb.String(),
+		Images:                 allImages,
+		ToolMode:               toolMode,
+		AllowedTools:           allowed,
 	}
 }
 

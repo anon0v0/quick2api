@@ -214,7 +214,7 @@ func TestPlanTurnFramesSingleAndStaged(t *testing.T) {
 	}
 
 	// 2. CPA-style oversized prompt (54KB CustomPrompt + 23KB Text + Attachments) -> 2 turns, every frame <= 58KB.
-	bigCP := strings.Repeat("TOOL_SCHEMA_LINE_0123456789\n", 1950) // ~54.6KB
+	bigCP := strings.Repeat("TOOL_SCHEMA_LINE_0123456789\n", 1950)         // ~54.6KB
 	bigText := strings.Repeat("CONVERSATION_LINE_\"quoted\"_<tag>\n", 700) // ~23.1KB
 	atts := []Attachment{{Type: "image", Name: "shot.jpg", Size: 150000, MimeType: "image/jpeg", AttachmentID: "att-1", Path: "/data/s3files/attached_files/shot.jpg"}}
 	turns, _, err = PlanTurnFrames(TurnRequest{
@@ -231,11 +231,11 @@ func TestPlanTurnFramesSingleAndStaged(t *testing.T) {
 	if len(turns) != 2 {
 		t.Fatalf("expected 2 turns for 54KB CP + 23KB Text (keeping full CP inline), got %d", len(turns))
 	}
-	if !turns[0].IsStaging || turns[0].ThinkingEffort != "low" || len(turns[0].Attachments) != 0 {
-		t.Fatalf("unexpected staging turn 0: isStaging=%v effort=%s atts=%d", turns[0].IsStaging, turns[0].ThinkingEffort, len(turns[0].Attachments))
+	if !turns[0].IsStaging || turns[0].ThinkingEffort != "low" || len(turns[0].Attachments) != 1 {
+		t.Fatalf("unexpected staging turn 0 (expected attachments staged on turn 0): isStaging=%v effort=%s atts=%d", turns[0].IsStaging, turns[0].ThinkingEffort, len(turns[0].Attachments))
 	}
-	if turns[1].IsStaging || turns[1].ThinkingEffort != "high" || len(turns[1].Attachments) != 1 || turns[1].CustomPrompt != bigCP {
-		t.Fatalf("expected full 54KB CustomPrompt preserved inline on final turn 1: isStaging=%v effort=%s atts=%d cpLen=%d", turns[1].IsStaging, turns[1].ThinkingEffort, len(turns[1].Attachments), len(turns[1].CustomPrompt))
+	if turns[1].IsStaging || turns[1].ThinkingEffort != "high" || len(turns[1].Attachments) != 0 || turns[1].CustomPrompt != bigCP {
+		t.Fatalf("expected full 54KB CustomPrompt preserved inline on final turn 1 without attachment bloat: isStaging=%v effort=%s atts=%d cpLen=%d", turns[1].IsStaging, turns[1].ThinkingEffort, len(turns[1].Attachments), len(turns[1].CustomPrompt))
 	}
 	for i, tr := range turns {
 		frame := buildUserMessageFrame(sampleUUID, "QUICK_WORK_DESKTOP_WINDOWS", "opus_4_6", tr.ThinkingEffort, tr.CustomPrompt, tr.Text, tr.Attachments)
@@ -247,10 +247,83 @@ func TestPlanTurnFramesSingleAndStaged(t *testing.T) {
 			t.Fatalf("turn %d produced invalid UTF-8", i)
 		}
 	}
+	// 2a. Regression: 57KB CustomPrompt + 5 delivered image attachments + 135KB conversation
+	// must keep full CustomPrompt inline on the final turn (preventing prompt-attack guardrail false positives)
+	// by placing attachments on Turn 0 and staying <= MaxInnerUserMessageBytes on every frame.
+	cp57k := "CRITICAL RULES: NEVER invoke built-in tools.\n" + strings.Repeat("TOOL_AND_SYS_LINE_0123456789\n", 1960) // ~57KB raw
+	conv135k := strings.Repeat("CONVERSATION_HISTORY_LINE_0123456789\n", 3650)                                         // ~135KB raw
+	fiveAtts := make([]Attachment, 5)
+	for i := range fiveAtts {
+		fiveAtts[i] = Attachment{
+			Type:          "image",
+			Name:          "shot.png",
+			Size:          500000,
+			MimeType:      "image/png",
+			AttachmentID:  "00000000-0000-4000-8000-000000000000",
+			ContentSha256: strings.Repeat("a", 64),
+			Path:          "/data/s3files/sessions/00000000-0000-4000-8000-000000000000/workspace/attached_files/shot.png",
+		}
+	}
+	turns57, _, err := PlanTurnFrames(TurnRequest{
+		CustomPrompt:        cp57k,
+		CompactCustomPrompt: "[Direct API Tool-Calling Mode] Use <quick_tool_call>.",
+		StageableCustomBody: "FALLBACK_BODY",
+		Text:                conv135k,
+		AgentMode:           "opus_4_6",
+		ThinkingEffort:      "high",
+		Attachments:         fiveAtts,
+	}, "QUICK_WORK_DESKTOP_WINDOWS", MaxInnerUserMessageBytes)
+	if err != nil {
+		t.Fatalf("PlanTurnFrames 57KB+5atts failed: %v", err)
+	}
+	if len(turns57) < 3 {
+		t.Fatalf("expected >=3 turns for 57KB CP + 135KB conv + 5 atts, got %d", len(turns57))
+	}
+	if len(turns57[0].Attachments) != 5 || len(turns57[len(turns57)-1].Attachments) != 0 {
+		t.Fatalf("expected all 5 attachments on turn 0 and 0 on final turn, got t0=%d tLast=%d", len(turns57[0].Attachments), len(turns57[len(turns57)-1].Attachments))
+	}
+	if turns57[len(turns57)-1].CustomPrompt != cp57k {
+		t.Fatalf("expected full 57KB CustomPrompt kept inline on final turn")
+	}
+	for i, tr := range turns57 {
+		frame := buildUserMessageFrame(sampleUUID, "QUICK_WORK_DESKTOP_WINDOWS", "opus_4_6", tr.ThinkingEffort, tr.CustomPrompt, tr.Text, tr.Attachments)
+		b, merr := MarshalAIDPInner(frame)
+		if merr != nil || len(b) > MaxInnerUserMessageBytes {
+			t.Fatalf("57KB+5atts turn %d exceeded %d bytes: len=%d err=%v", i, MaxInnerUserMessageBytes, len(b), merr)
+		}
+		if i < len(turns57)-1 && strings.Contains(tr.Text, "CRITICAL RULES") {
+			t.Fatalf("57KB+5atts staging turn %d leaked CustomPrompt into user text", i)
+		}
+	}
 
-	// 2b. Huge CustomPrompt (>58KB alone) stages only neutral StageableCustomBody while keeping CompactCustomPrompt in custom_prompt.
-	hugeCP := "CRITICAL RULES: NEVER invoke built-in tools.\n" + strings.Repeat("SYS_DOC_LINE_0123456789\n", 2600)
-	neutralBody := strings.Repeat("NEUTRAL_REF_LINE_0123456789\n", 2400)
+	// 2a2. Attachment-only overflow: 57KB CP + 4KB Text fits without attachments, but 10 attachments push singleSize > limit.
+	tenAtts := append(append([]Attachment{}, fiveAtts...), fiveAtts...)
+	turnsAttOnly, _, err := PlanTurnFrames(TurnRequest{
+		CustomPrompt:   cp57k,
+		Text:           strings.Repeat("Short reply prompt.\n", 180), // ~3.6KB
+		AgentMode:      "opus_4_6",
+		ThinkingEffort: "high",
+		Attachments:    tenAtts,
+	}, "QUICK_WORK_DESKTOP_WINDOWS", MaxInnerUserMessageBytes)
+	if err != nil {
+		t.Fatalf("PlanTurnFrames attachment-only overflow failed: %v", err)
+	}
+	if len(turnsAttOnly) != 2 || len(turnsAttOnly[0].Attachments) != 10 || len(turnsAttOnly[1].Attachments) != 0 || turnsAttOnly[1].CustomPrompt != cp57k {
+		t.Fatalf("expected 2 turns (attachments on turn 0, full CP inline on turn 1), got len=%d t0Atts=%d t1Atts=%d cpMatch=%v",
+			len(turnsAttOnly), len(turnsAttOnly[0].Attachments), len(turnsAttOnly[len(turnsAttOnly)-1].Attachments), turnsAttOnly[len(turnsAttOnly)-1].CustomPrompt == cp57k)
+	}
+	for i, tr := range turnsAttOnly {
+		frame := buildUserMessageFrame(sampleUUID, "QUICK_WORK_DESKTOP_WINDOWS", "opus_4_6", tr.ThinkingEffort, tr.CustomPrompt, tr.Text, tr.Attachments)
+		b, merr := MarshalAIDPInner(frame)
+		if merr != nil || len(b) > MaxInnerUserMessageBytes {
+			t.Fatalf("att-only overflow turn %d exceeded %d bytes: len=%d err=%v", i, MaxInnerUserMessageBytes, len(b), merr)
+		}
+	}
+	// 2b. Huge CustomPrompt (~110KB, e.g. SillyTavern card + closing preset) uses hybrid inline fill:
+	// packs the largest tail (~60KB, including closing rules) into final turn's custom_prompt,
+	// and stages only the opening prefix into Turn 0 (keeping CRITICAL RULES out of user text).
+	hugeCP := "CRITICAL RULES: NEVER invoke built-in tools.\n" + strings.Repeat("SYS_DOC_LINE_0123456789\n", 4600) + "CLOSING_PRESET_CANARY\n"
+	neutralBody := "OPENING_LORE_CANARY\n" + strings.Repeat("NEUTRAL_REF_LINE_0123456789\n", 3900) + "CLOSING_PRESET_CANARY\n"
 	turnsHuge, _, err := PlanTurnFrames(TurnRequest{
 		CustomPrompt:        hugeCP,
 		CompactCustomPrompt: "[Direct API Tool-Calling Mode] Use <quick_tool_call>.",
@@ -262,16 +335,61 @@ func TestPlanTurnFramesSingleAndStaged(t *testing.T) {
 	if err != nil {
 		t.Fatalf("PlanTurnFrames huge CP failed: %v", err)
 	}
-	if len(turnsHuge) < 3 {
-		t.Fatalf("expected >=3 turns for 67KB neutral body + final text, got %d", len(turnsHuge))
+	if len(turnsHuge) != 2 {
+		t.Fatalf("expected 2 turns for 110KB body via hybrid inline tail (~50KB staged + ~60KB inline CP), got %d", len(turnsHuge))
 	}
-	for i := 0; i < len(turnsHuge)-1; i++ {
-		if strings.Contains(turnsHuge[i].Text, "CRITICAL RULES") {
-			t.Fatalf("staging turn %d must NOT move CRITICAL RULES into user text", i)
+	if strings.Contains(turnsHuge[0].Text, "CRITICAL RULES") || strings.Contains(turnsHuge[0].Text, "CLOSING_PRESET_CANARY") {
+		t.Fatalf("staging turn 0 must NOT contain CRITICAL RULES or closing preset tail")
+	}
+	if !strings.Contains(turnsHuge[0].Text, "OPENING_LORE_CANARY") {
+		t.Fatalf("expected opening prefix in staging turn 0")
+	}
+	finalHugeCP := turnsHuge[len(turnsHuge)-1].CustomPrompt
+	if !strings.Contains(finalHugeCP, "<quick_tool_call>") || !strings.Contains(finalHugeCP, "CLOSING_PRESET_CANARY") {
+		t.Fatalf("expected CompactCustomPrompt + closing preset tail in final custom_prompt, got len=%d", len(finalHugeCP))
+	}
+	for i, tr := range turnsHuge {
+		frame := buildUserMessageFrame(sampleUUID, "QUICK_WORK_DESKTOP_WINDOWS", "opus_4_6", tr.ThinkingEffort, tr.CustomPrompt, tr.Text, tr.Attachments)
+		b, merr := MarshalAIDPInner(frame)
+		if merr != nil || len(b) > MaxInnerUserMessageBytes {
+			t.Fatalf("huge CP turn %d exceeded %d bytes: len=%d err=%v", i, MaxInnerUserMessageBytes, len(b), merr)
 		}
 	}
-	if !strings.Contains(turnsHuge[len(turnsHuge)-1].CustomPrompt, "<quick_tool_call>") {
-		t.Fatalf("expected CompactCustomPrompt on final turn, got %q", turnsHuge[len(turnsHuge)-1].CustomPrompt)
+
+	// 2c. Oversized tool-mode CustomPrompt (25KB tools + 50KB system = 75KB > 63KB):
+	// keeps 100% of tool definitions + tail of system prompt in final custom_prompt,
+	// staging ONLY the opening system prefix so zero JSON tool schemas enter user_message.text.
+	toolInline25k := "[Direct API Tool-Calling Mode]\nDeclared Caller Tools:\n" + strings.Repeat("- {\"name\":\"tool_x\",\"description\":\"desc 0123456789\"}\n", 480)
+	sysBody50k := "SYS_HEAD_CANARY\n" + strings.Repeat("SYSTEM_GUIDELINE_LINE_0123456789\n", 1500) + "SYS_TAIL_CANARY\n"
+	turnsToolHybrid, _, err := PlanTurnFrames(TurnRequest{
+		CustomPrompt:           toolInline25k + "\n\n" + sysBody50k,
+		CompactCustomPrompt:    "[Direct API Tool-Calling Mode] Use <quick_tool_call>.",
+		ToolInlineCustomPrompt: toolInline25k,
+		StageableSystemBody:    sysBody50k,
+		StageableCustomBody:    "Declared Caller Tools:\n" + sysBody50k,
+		Text:                   "Call tool_x.",
+		AgentMode:              "opus_4_6",
+		ThinkingEffort:         "high",
+	}, "QUICK_WORK_DESKTOP_WINDOWS", MaxInnerUserMessageBytes)
+	if err != nil {
+		t.Fatalf("PlanTurnFrames tool hybrid failed: %v", err)
+	}
+	if len(turnsToolHybrid) != 2 {
+		t.Fatalf("expected 2 turns for 75KB tool+system hybrid, got %d", len(turnsToolHybrid))
+	}
+	if strings.Contains(turnsToolHybrid[0].Text, "Declared Caller Tools") || !strings.Contains(turnsToolHybrid[0].Text, "SYS_HEAD_CANARY") {
+		t.Fatalf("expected only system prefix (zero tool schemas) in turn 0")
+	}
+	finalToolCP := turnsToolHybrid[1].CustomPrompt
+	if !strings.Contains(finalToolCP, "Declared Caller Tools") || !strings.Contains(finalToolCP, "SYS_TAIL_CANARY") {
+		t.Fatalf("expected 100%% of tools + system tail in final custom_prompt")
+	}
+	for i, tr := range turnsToolHybrid {
+		frame := buildUserMessageFrame(sampleUUID, "QUICK_WORK_DESKTOP_WINDOWS", "opus_4_6", tr.ThinkingEffort, tr.CustomPrompt, tr.Text, tr.Attachments)
+		b, merr := MarshalAIDPInner(frame)
+		if merr != nil || len(b) > MaxInnerUserMessageBytes {
+			t.Fatalf("tool hybrid turn %d exceeded %d bytes: len=%d err=%v", i, MaxInnerUserMessageBytes, len(b), merr)
+		}
 	}
 
 	// 3. Modest CustomPrompt (4KB) + huge UTF-8 Chinese/escaped Text (130KB) -> keeps full CustomPrompt inline on final turn & preserves valid UTF-8.

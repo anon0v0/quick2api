@@ -93,6 +93,7 @@ func New(cfg config.Config, store *auth.Store, manager *quick.Manager) *Server {
 	s.mux.HandleFunc("/admin/accounts/delete", s.withAdminAuth(s.handleAdminAccountDelete))
 	return s
 }
+
 // SetLogBuffer attaches the shared process log ring buffer to /admin/logs.
 func (s *Server) SetLogBuffer(buf *telemetry.LogBuffer) {
 	if buf != nil {
@@ -686,15 +687,17 @@ func (s *Server) startTurnWithRetry(ctx context.Context, target models.ResolvedT
 		}
 
 		ch, serr := s.manager.StreamTurn(ctx, acct, quick.TurnRequest{
-			ThreadID:            threadID,
-			Text:                converted.Text,
-			CustomPrompt:        converted.CustomPrompt,
-			CompactCustomPrompt: converted.CompactCustomPrompt,
-			StageableCustomBody: converted.StageableCustomBody,
-			AgentMode:           target.AgentMode,
-			ThinkingEffort:      target.ThinkingEffort,
-			Attachments:         attachments,
-			SurfaceType:         s.cfg.DefaultSurface,
+			ThreadID:               threadID,
+			Text:                   converted.Text,
+			CustomPrompt:           converted.CustomPrompt,
+			CompactCustomPrompt:    converted.CompactCustomPrompt,
+			ToolInlineCustomPrompt: converted.ToolInlineCustomPrompt,
+			StageableSystemBody:    converted.StageableSystemBody,
+			StageableCustomBody:    converted.StageableCustomBody,
+			AgentMode:              target.AgentMode,
+			ThinkingEffort:         target.ThinkingEffort,
+			Attachments:            attachments,
+			SurfaceType:            s.cfg.DefaultSurface,
 		})
 		if serr == nil {
 			return acct, ch, nil
@@ -772,6 +775,7 @@ func (s *Server) uploadImages(ctx context.Context, acct auth.Account, threadID s
 	}
 	return out, lastWarn
 }
+
 // ---------------------------------------------------------------------------
 // OpenAI Streaming (SSE) & Non-Streaming response builders
 // ---------------------------------------------------------------------------
